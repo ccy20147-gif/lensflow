@@ -1,0 +1,2 @@
+[console_scripts]
+toonflow-runtime-worker = src.domain.runtime.worker_entrypoint:main

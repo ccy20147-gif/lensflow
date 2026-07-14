@@ -1,0 +1,40 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: toonflow
+      POSTGRES_USER: toonflow
+      POSTGRES_PASSWORD: toonflow
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U toonflow -d toonflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes: ["toonflow_pg:/var/lib/postgresql/data"]
+  api:
+    build: ./backend
+    command: uvicorn src.app:app --host 0.0.0.0 --port 8000
+    environment:
+      DATABASE_URL: postgresql+asyncpg://toonflow:toonflow@postgres:5432/toonflow
+      DATABASE_URL_SYNC: postgresql+psycopg2://toonflow:toonflow@postgres:5432/toonflow
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    ports: ["8000:8000"]
+  worker:
+    build: ./backend
+    command: toonflow-runtime-worker --worker-id worker-1
+    environment:
+      DATABASE_URL: postgresql+asyncpg://toonflow:toonflow@postgres:5432/toonflow
+      DATABASE_URL_SYNC: postgresql+psycopg2://toonflow:toonflow@postgres:5432/toonflow
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+  migrate:
+    build: ./backend
+    command: alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql+asyncpg://toonflow:toonflow@postgres:5432/toonflow
+      DATABASE_URL_SYNC: postgresql+psycopg2://toonflow:toonflow@postgres:5432/toonflow
+    depends_on:
+      postgres: { condition: service_healthy }
+volumes:
+  toonflow_pg:
