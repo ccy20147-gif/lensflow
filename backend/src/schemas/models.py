@@ -189,6 +189,9 @@ class NodeDefinitionRevision(BaseModel):
     executor_ref: str = ""
     policy_metadata: dict[str, Any] = {}
     ui_metadata: dict[str, Any] = {}
+    # Optional platform-owned expansion template for a managed Agent card.
+    # It is part of the registry revision, never AgentRevision content.
+    managed_agent_task_plan: list[dict[str, Any]] = []
 
 
 class PortTypeRef(BaseModel):
@@ -224,6 +227,10 @@ class CompiledExecutionPlan(BaseModel):
     provider_policy_ref: str = ""
     capability_snapshots: list[str] = []
     policy_revisions: list[str] = []
+    # Server-derived authorization evidence used at compilation time. It is
+    # intentionally decision metadata only: no credential or raw policy body.
+    actor_scope: str = ""
+    entitlement_snapshot: dict[str, Any] = {}
     budget_limits: dict[str, Any] = {}
     compiler_version: str = "1.0"
     plan_hash: str = ""
@@ -434,15 +441,25 @@ class AgentRevision(BaseModel):
     # must also declare the operations, scopes, and fields it may disclose.
     tool_access_plan: list["ToolAccessPlanEntry"] = []
     execution_policy: dict[str, Any] = {}
+    # These are persisted revision contracts, not UI-only preferences.  A
+    # missing value on a pre-migration revision means the bounded platform
+    # default (RequestInput disabled, broker-only execution).
+    request_input_policy: dict[str, Any] = {}
+    execution_boundary: str = "runtime_and_approved_tool_broker_only"
 
 
 class SopStep(BaseModel):
     step_id: str
     instruction: str
     input_bindings: dict[str, str] = {}
+    # These mappings are part of the immutable SOP contract.  They are kept
+    # separate from the schema reference so Studio can describe data flow
+    # without embedding executable expressions.
+    output_bindings: dict[str, str] = {}
     output_schema_ref: str = ""
     retry_policy: dict[str, Any] = {}
     checkpoint_policy: dict[str, Any] = {}
+    failure_policy: dict[str, Any] = {}
 
 
 class ToolAccessPlanOperation(BaseModel):

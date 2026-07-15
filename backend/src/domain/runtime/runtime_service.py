@@ -232,6 +232,25 @@ class RuntimeService:
                             NodeRunAttemptModel.status.in_([AttemptStatus.PENDING, AttemptStatus.LEASED, AttemptStatus.RUNNING, AttemptStatus.WAITING_EXTERNAL, AttemptStatus.UNKNOWN]),
                         )):
                             attempt.status = AttemptStatus.CANCELLED
+                            for provider in session.scalars(select(ProviderInvocationAttemptModel).where(
+                                ProviderInvocationAttemptModel.node_run_attempt_id == attempt.attempt_id,
+                                ProviderInvocationAttemptModel.status.in_([
+                                    AttemptStatus.PENDING, AttemptStatus.LEASED, AttemptStatus.RUNNING,
+                                    AttemptStatus.WAITING_EXTERNAL, AttemptStatus.UNKNOWN,
+                                ]),
+                            )):
+                                provider.status = AttemptStatus.CANCELLED
+                                # Providers may not support a hard cancel, but
+                                # this durable request makes the cancellation
+                                # visible to the dispatcher without trusting a
+                                # late output.
+                                session.add(OutboxEventModel(
+                                    event_id=uuid.uuid4(), aggregate_type="provider_invocation",
+                                    aggregate_id=provider.provider_attempt_id,
+                                    event_type="provider.cancel_requested", purpose="provider_cancel",
+                                    payload={"run_id": str(run_id), "attempt_id": str(attempt.attempt_id)},
+                                    created_at=datetime.now(timezone.utc),
+                                ))
                 # Parent cancellation propagates to every fixed child run;
                 # it never leaves an orphaned subworkflow consuming budget.
                 for binding in session.scalars(select(SubworkflowModel).where(SubworkflowModel.run_id == run_id)):
@@ -293,11 +312,33 @@ class RuntimeService:
         if self._session_factory is not None:
             with self._session_factory.begin() as session:
                 node = self._sql_required(session, NodeRunModel, node_run_id, "NodeRun")
+                run = self._sql_required(session, WorkflowRunModel, node.run_id, "WorkflowRun")
+                if run.status not in {RunStatus.QUEUED, RunStatus.RUNNING}:
+                    raise ConflictError("A terminal or cancelled workflow may not create a new attempt")
+                previous = session.scalar(
+                    select(NodeRunAttemptModel)
+                    .where(NodeRunAttemptModel.node_run_id == node_run_id)
+                    .order_by(NodeRunAttemptModel.execution_epoch.desc())
+                    .with_for_update()
+                    .limit(1)
+                )
+                if previous is not None and previous.status == AttemptStatus.UNKNOWN:
+                    raise ConflictError("Unknown attempt must reconcile before retry")
+                # A retry is a retry of the exact committed input contract.
+                # "latest" is represented by a separate immutable run slice,
+                # never by overwriting the input of this NodeRun.
+                retry_input = dict(previous.fixed_input or {}) if previous is not None else {}
+                if previous is not None and previous.status in {
+                    AttemptStatus.PENDING, AttemptStatus.LEASED, AttemptStatus.RUNNING,
+                    AttemptStatus.WAITING_EXTERNAL,
+                }:
+                    previous.status = AttemptStatus.SUPERSEDED
                 count = session.scalar(select(func.count()).select_from(NodeRunAttemptModel).where(NodeRunAttemptModel.node_run_id == node_run_id)) or 0
                 row = NodeRunAttemptModel(
                     attempt_id=uuid.uuid4(), node_run_id=node_run_id,
                     attempt_number=count + 1, execution_epoch=count + 1,
-                    fixed_input=fixed_input or {}, status=AttemptStatus.PENDING,
+                    fixed_input=dict(fixed_input) if fixed_input is not None else retry_input,
+                    status=AttemptStatus.PENDING,
                 )
                 session.add(row)
                 node.status = NodeRunStatus.RUNNING
@@ -305,18 +346,25 @@ class RuntimeService:
                 return self._attempt_schema(row)
         node_run = self._get_node_run(node_run_id)
 
-        # Count existing attempts
-        existing = sum(
-            1 for a in self._attempts.values()
-            if a.node_run_id == node_run_id
+        prior = sorted(
+            (a for a in self._attempts.values() if a.node_run_id == node_run_id),
+            key=lambda item: item.execution_epoch,
         )
+        if prior and prior[-1].status == AttemptStatus.UNKNOWN:
+            raise ConflictError("Unknown attempt must reconcile before retry")
+        if prior and prior[-1].status in {
+            AttemptStatus.PENDING, AttemptStatus.LEASED, AttemptStatus.RUNNING,
+            AttemptStatus.WAITING_EXTERNAL,
+        }:
+            prior[-1].status = AttemptStatus.SUPERSEDED
+        existing = len(prior)
 
         attempt = NodeRunAttempt(
             attempt_id=uuid.uuid4(),
             node_run_id=node_run_id,
             attempt_number=existing + 1,
             execution_epoch=existing + 1,
-            fixed_input=fixed_input or {},
+            fixed_input=dict(fixed_input) if fixed_input is not None else (dict(prior[-1].fixed_input) if prior else {}),
             status=AttemptStatus.PENDING,
         )
         self._attempts[attempt.attempt_id] = attempt
@@ -482,14 +530,26 @@ class RuntimeService:
         model_id: str,
         idempotency_key: str,
         request_body_hash: str,
+        dispatch_payload: dict[str, Any] | None = None,
     ) -> tuple[ProviderInvocationAttempt, OutboxEvent]:
         """Create ProviderInvocationAttempt + dispatch OutboxEvent in same transaction.
 
         The network call MUST happen after the transaction commits.
         """
         if self._session_factory is not None:
-            return self._sql_dispatch_provider(attempt_id, provider_id, model_id, idempotency_key, request_body_hash)
+            return self._sql_dispatch_provider(
+                attempt_id, provider_id, model_id, idempotency_key, request_body_hash,
+                dispatch_payload,
+            )
         attempt = self._get_attempt(attempt_id)
+        node = self._get_node_run(attempt.node_run_id)
+        run = self._get_run(node.run_id)
+        if run.status in {RunStatus.CANCELLING, RunStatus.CANCELLED} or attempt.status in {
+            AttemptStatus.CANCELLED, AttemptStatus.SUPERSEDED,
+        }:
+            raise ConflictError("Cancelled or superseded attempt cannot dispatch a provider request")
+        if any(item.node_run_attempt_id == attempt_id for item in self._provider_attempts.values()):
+            raise ConflictError("NodeRunAttempt already has a provider invocation")
 
         provider_attempt = ProviderInvocationAttempt(
             provider_attempt_id=uuid.uuid4(),
@@ -511,6 +571,7 @@ class RuntimeService:
                 "provider_id": provider_id,
                 "model_id": model_id,
                 "idempotency_key": idempotency_key,
+                **({"dispatch": dispatch_payload} if dispatch_payload else {}),
             },
             purpose="provider_dispatch",
             created_at=datetime.now(timezone.utc),
@@ -543,6 +604,12 @@ class RuntimeService:
         parent_attempt = self._get_attempt(provider_attempt.node_run_attempt_id)
         if current_epoch is not None and parent_attempt.execution_epoch != current_epoch:
             raise ConflictError("执行纪元过期，结果被拒绝")
+        node_run = self._get_node_run(parent_attempt.node_run_id)
+        run = self._get_run(node_run.run_id)
+        if run.status in {RunStatus.CANCELLING, RunStatus.CANCELLED} or parent_attempt.status in {
+            AttemptStatus.CANCELLED, AttemptStatus.SUPERSEDED,
+        }:
+            raise ConflictError("Cancelled or superseded attempt cannot publish a provider result")
 
         # Create the record
         record = ProviderInvocationRecord(
@@ -757,11 +824,15 @@ class RuntimeService:
                         "payload": typed_payload or {}, "task_version": task.task_version,
                     }
                     attempt.fixed_input = fixed_input
-                    attempt.status = AttemptStatus.RUNNING
-                    node.status = NodeRunStatus.RUNNING
+                    # A Human Gate decision is the terminal execution of the
+                    # gate node itself.  Completing it in this transaction
+                    # lets the immutable scheduler materialise every newly
+                    # ready downstream node without a browser-side nudge.
+                    attempt.status = AttemptStatus.COMPLETED
+                    attempt.completed_at = datetime.now(timezone.utc)
+                    node.status = NodeRunStatus.COMPLETED
                     run = self._sql_required(session, WorkflowRunModel, task.run_id, "WorkflowRun")
-                    if run.status == RunStatus.WAITING_USER:
-                        run.status = RunStatus.RUNNING
+                    self._sql_schedule_ready(session, run)
                 elif outcome == "cancel":
                     node = self._sql_required(session, NodeRunModel, task.node_run_id, "NodeRun")
                     node.status = NodeRunStatus.CANCELLED
@@ -774,6 +845,8 @@ class RuntimeService:
                     run = self._sql_required(session, WorkflowRunModel, task.run_id, "WorkflowRun")
                     # Run-level failure is durable; reversible flows use cancel.
                     run.status = RunStatus.FAILED
+                if terminal_status != HumanTaskStatus.ACCEPTED:
+                    self._sql_aggregate_run(session, run)
                 event = OutboxEventModel(
                     event_id=uuid.uuid4(),
                     aggregate_type="human_task",
@@ -1150,6 +1223,11 @@ class RuntimeService:
         More specialised executors (map/fold/subworkflow) consume that same
         attempt rather than allowing a public side API to manufacture state.
         """
+        # Cancellation is a scheduling fence.  A late worker/callback may
+        # still enter this method through a stale code path, but it must not
+        # materialise another NodeRunAttempt after cancellation was committed.
+        if run.status not in {RunStatus.QUEUED, RunStatus.RUNNING}:
+            return
         if graph is None:
             revision = self._sql_required(session, WorkflowRevisionModel, run.workflow_revision_id, "WorkflowRevision")
             graph = revision.graph if isinstance(revision.graph, dict) else {}
@@ -1558,6 +1636,7 @@ class RuntimeService:
     def _sql_dispatch_provider(
         self, attempt_id: uuid.UUID, provider_id: str, model_id: str,
         idempotency_key: str, request_body_hash: str,
+        dispatch_payload: dict[str, Any] | None = None,
     ) -> tuple[ProviderInvocationAttempt, OutboxEvent]:
         """Insert invocation and dispatch event in one database transaction."""
         assert self._session_factory is not None
@@ -1570,6 +1649,17 @@ class RuntimeService:
                 if event is None:
                     raise ConflictError("幂等 Provider 调用缺少 dispatch outbox")
                 return self._provider_attempt_schema(prior), self._outbox_schema(event)
+            node = self._sql_required(session, NodeRunModel, attempt.node_run_id, "NodeRun")
+            run = self._sql_required(session, WorkflowRunModel, node.run_id, "WorkflowRun")
+            if run.status in {RunStatus.CANCELLING, RunStatus.CANCELLED} or attempt.status in {
+                AttemptStatus.CANCELLED, AttemptStatus.SUPERSEDED,
+            }:
+                raise ConflictError("Cancelled or superseded attempt cannot dispatch a provider request")
+            existing_attempt = session.scalar(select(ProviderInvocationAttemptModel).where(
+                ProviderInvocationAttemptModel.node_run_attempt_id == attempt_id,
+            ))
+            if existing_attempt is not None:
+                raise ConflictError("NodeRunAttempt already has a provider invocation")
             provider = ProviderInvocationAttemptModel(
                 provider_attempt_id=uuid.uuid4(), node_run_attempt_id=attempt_id,
                 provider_id=provider_id, model_id=model_id, idempotency_key=idempotency_key,
@@ -1579,7 +1669,15 @@ class RuntimeService:
             event = OutboxEventModel(
                 event_id=uuid.uuid4(), aggregate_type="provider_invocation",
                 aggregate_id=provider.provider_attempt_id, event_type="provider.dispatch",
-                payload={"provider_id": provider_id, "model_id": model_id, "idempotency_key": idempotency_key},
+                payload={
+                    "provider_id": provider_id,
+                    "model_id": model_id,
+                    "idempotency_key": idempotency_key,
+                    # This is a frozen execution contract, not caller input.
+                    # It lets a worker safely re-deliver the same request after
+                    # a crash before the provider outcome was known.
+                    **({"dispatch": dispatch_payload} if dispatch_payload else {}),
+                },
                 purpose="provider_dispatch", created_at=datetime.now(timezone.utc),
             )
             session.add_all([provider, event])
@@ -1604,6 +1702,12 @@ class RuntimeService:
                 if event is None:
                     raise ConflictError("幂等 Provider 结果缺少 result outbox")
                 return self._provider_record_schema(existing), self._outbox_schema(event)
+            node_run = self._sql_required(session, NodeRunModel, attempt.node_run_id, "NodeRun")
+            run = self._sql_required(session, WorkflowRunModel, node_run.run_id, "WorkflowRun")
+            if run.status in {RunStatus.CANCELLING, RunStatus.CANCELLED} or attempt.status in {
+                AttemptStatus.CANCELLED, AttemptStatus.SUPERSEDED,
+            }:
+                raise ConflictError("Cancelled or superseded attempt cannot publish a provider result")
             missing = session.scalar(select(func.count()).select_from(ArtifactVersionModel).where(ArtifactVersionModel.artifact_version_id.in_(artifact_ids))) if artifact_ids else 0
             if artifact_ids and missing != len(set(artifact_ids)):
                 raise NotFoundError("ArtifactVersion", "provider output artifact")
@@ -1628,14 +1732,13 @@ class RuntimeService:
                 ))
             provider.status = AttemptStatus.COMPLETED
             attempt.status, attempt.completed_at = AttemptStatus.COMPLETED, now
-            node_run = self._sql_required(session, NodeRunModel, attempt.node_run_id, "NodeRun")
             node_run.status = NodeRunStatus.COMPLETED
             # Parent Subworkflow aggregation reads NodeRun and output binding
             # rows immediately below.  These models intentionally have no ORM
             # relationships, so make their FK/state writes visible before the
             # scheduler performs its in-transaction query chain.
             session.flush()
-            self._sql_schedule_ready(session, self._sql_required(session, WorkflowRunModel, node_run.run_id, "WorkflowRun"))
+            self._sql_schedule_ready(session, run)
             session.flush()
             return self._provider_record_schema(record), self._outbox_schema(event)
 
@@ -1665,6 +1768,12 @@ class RuntimeService:
                 if event is None:
                     raise ConflictError("幂等 Provider 结果缺少 result outbox")
                 return self._provider_record_schema(existing), self._outbox_schema(event), ids
+            node_run = self._sql_required(session, NodeRunModel, attempt.node_run_id, "NodeRun")
+            run = self._sql_required(session, WorkflowRunModel, node_run.run_id, "WorkflowRun")
+            if run.status in {RunStatus.CANCELLING, RunStatus.CANCELLED} or attempt.status in {
+                AttemptStatus.CANCELLED, AttemptStatus.SUPERSEDED,
+            }:
+                raise ConflictError("Cancelled or superseded attempt cannot publish a provider result")
             now = datetime.now(timezone.utc)
             artifact_ids: list[uuid.UUID] = []
             for output in outputs:
@@ -1685,10 +1794,9 @@ class RuntimeService:
                 session.add(ProviderOutputBindingModel(binding_id=uuid.uuid4(), record_id=record.record_id, output_artifact_version_id=artifact_id, output_index=index))
             provider.status = AttemptStatus.COMPLETED
             attempt.status, attempt.completed_at = AttemptStatus.COMPLETED, now
-            node_run = self._sql_required(session, NodeRunModel, attempt.node_run_id, "NodeRun")
             node_run.status = NodeRunStatus.COMPLETED
             session.flush()
-            self._sql_schedule_ready(session, self._sql_required(session, WorkflowRunModel, node_run.run_id, "WorkflowRun"))
+            self._sql_schedule_ready(session, run)
             session.flush()
             return self._provider_record_schema(record), self._outbox_schema(event), artifact_ids
 

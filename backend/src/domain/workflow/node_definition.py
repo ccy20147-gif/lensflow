@@ -61,6 +61,11 @@ def validate_definition(ndr: NodeDefinitionRevision) -> None:
     # intentionally represented as opaque IDs elsewhere, never secret values.
     _check_secrets(ndr.policy_metadata, field="policy_metadata", errors=errors)
     _check_secrets(ndr.ui_metadata, field="ui_metadata", errors=errors)
+    for index, task in enumerate(ndr.managed_agent_task_plan):
+        if not isinstance(task, dict) or task.get("kind") not in {"agent_invoke", "request_input", "human_gate", "workbench_task", "resource_commit"}:
+            errors.setdefault("managed_agent_task_plan", {})[str(index)] = "task requires an approved workflow task kind"
+        elif task.get("owner_layer") not in {None, "workflow"}:
+            errors.setdefault("managed_agent_task_plan", {})[str(index)] = "managed task owner must be workflow"
 
     if errors:
         raise ValidationError_(

@@ -513,13 +513,32 @@ export interface SkillRecord {
   owner_scope: string
   body: Record<string, unknown>
   content_hash: string
-  status: string
+  status: 'draft' | 'active' | 'retired'
   created_at: string
   updated_at: string
 }
 
+export interface SkillRevisionRecord {
+  revision_id: string
+  skill_id: string
+  revision_number: number
+  body: Record<string, unknown>
+  content_hash: string
+  status: 'active' | 'retired'
+  created_at: string
+}
+
+export interface SkillDryRunResult {
+  valid: boolean
+  resolved_sections: Array<{ section: string; content: unknown; tokens_estimate: number }>
+  token_accounting: { total_estimated_tokens: number; max_tokens: number }
+  conflicts: string[]
+  security_decisions: string[]
+  final_context_hash: string
+}
+
 export function listSkills(ownerScope?: string): Promise<SkillRecord[]> {
-  return apiGet<SkillRecord[]>('/skills/', { owner_scope: ownerScope })
+  return apiGet<SkillRecord[]>('/skills', { owner_scope: ownerScope })
 }
 
 export function getSkill(skillId: string): Promise<SkillRecord> {
@@ -532,7 +551,7 @@ export function createSkill(body: {
   owner_scope?: string
   body?: Record<string, unknown>
 }): Promise<SkillRecord> {
-  return apiPost<SkillRecord>('/skills/', body)
+  return apiPost<SkillRecord>('/skills', body)
 }
 
 export function updateSkill(
@@ -550,8 +569,20 @@ export function validateSkillBody(body: Record<string, unknown>): Promise<{ vali
   return apiPost<{ valid: boolean }>('/skills/validate', { body })
 }
 
-export function dryRunSkill(body: Record<string, unknown>): Promise<{ valid: boolean }> {
-  return apiPost<{ valid: boolean }>('/skills/dry-run', { body })
+export function dryRunSkill(body: Record<string, unknown>): Promise<SkillDryRunResult> {
+  return apiPost<SkillDryRunResult>('/skills/dry-run', { body })
+}
+
+export function submitSkillRevision(skillId: string, baseHash: string): Promise<SkillRevisionRecord> {
+  return apiPost<SkillRevisionRecord>(`/skills/${encodeURIComponent(skillId)}/revisions`, { base_hash: baseHash })
+}
+
+export function listSkillRevisions(skillId: string): Promise<SkillRevisionRecord[]> {
+  return apiGet<SkillRevisionRecord[]>(`/skills/${encodeURIComponent(skillId)}/revisions`)
+}
+
+export function retireSkillRevision(skillId: string, revisionId: string): Promise<SkillRevisionRecord> {
+  return apiPost<SkillRevisionRecord>(`/skills/${encodeURIComponent(skillId)}/revisions/${encodeURIComponent(revisionId)}/retire`)
 }
 
 // ---------------------------------------------------------------------------
@@ -679,6 +710,29 @@ export function dryRunRecipe(
   body: Record<string, unknown>,
 ): Promise<RecipeDryRunResult> {
   return apiPost<RecipeDryRunResult>('/recipes/dry-run', { body })
+}
+
+export interface RecipeTrialResult {
+  run_id: string
+  node_run_attempt_id: string
+  provider_attempt_id?: string
+  status: string
+  record_id?: string
+  artifact_version_ids?: string[]
+  outbox_event_id?: string
+  operator_attempt_ids?: string[]
+  lab_trial: true
+}
+
+export function executeRecipeTrial(
+  recipeId: string,
+  revisionId: string,
+  body: { inputs: Record<string, unknown>; idempotency_key: string },
+): Promise<RecipeTrialResult> {
+  return apiPost<RecipeTrialResult>(
+    `/recipes/${encodeURIComponent(recipeId)}/revisions/${encodeURIComponent(revisionId)}/trial`,
+    body,
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -865,6 +919,8 @@ export interface TemplateInstance {
   created_at: string
 }
 
+export interface TemplateReplacementOptions { slots: Array<{ slot_id: string; expected_kind: string; candidates: Array<{ revision_id: string; label: string }> }> }
+
 export function listTemplates(): Promise<TemplateSummary[]> {
   return apiGet<TemplateSummary[]>('/templates')
 }
@@ -875,6 +931,10 @@ export function seedBenchmarkTemplates(): Promise<{ template_ids: string[] }> {
 
 export function getTemplate(templateId: string): Promise<TemplateDetail> {
   return apiGet<TemplateDetail>(`/templates/${encodeURIComponent(templateId)}`)
+}
+
+export function getTemplateReplacementOptions(templateId: string): Promise<TemplateReplacementOptions> {
+  return apiGet<TemplateReplacementOptions>(`/templates/${encodeURIComponent(templateId)}/replacement-options`)
 }
 
 export function resolveTemplateDependencies(

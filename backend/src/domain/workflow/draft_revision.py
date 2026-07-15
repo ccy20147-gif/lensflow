@@ -23,6 +23,32 @@ _PRESENTATION_NODE_KEYS = frozenset({
 })
 
 
+def required_human_gate_ids(graph: dict[str, Any]) -> set[str]:
+    """Return workflow-owned gates that may not be silently removed.
+
+    A human gate defaults to ``domain_required`` when an older graph lacks an
+    explicit strength, matching the runtime's materialisation default.  The
+    helper accepts both persisted graph shapes used by the canvas.
+    """
+    raw_nodes = (graph or {}).get("nodes", [])
+    nodes = raw_nodes.values() if isinstance(raw_nodes, dict) else raw_nodes
+    required: set[str] = set()
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        data = node.get("data") if isinstance(node.get("data"), dict) else {}
+        node_type = str(data.get("node_type_id") or node.get("type") or "")
+        if node_type != "human_gate":
+            continue
+        config = node.get("config") if isinstance(node.get("config"), dict) else data.get("config", {})
+        config = config if isinstance(config, dict) else {}
+        if str(config.get("policy_strength", "domain_required")) in {"domain_required", "policy_required"}:
+            node_id = str(node.get("id", ""))
+            if node_id:
+                required.add(node_id)
+    return required
+
+
 def normalize_graph_and_layout(
     graph: dict[str, Any], layout: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:

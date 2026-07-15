@@ -241,6 +241,7 @@ class ResourceDraftModel(Base):
     base_revision_id = Column(UUID(as_uuid=True), nullable=True)
     content_artifact_version_id = Column(UUID(as_uuid=True), ForeignKey("artifact_versions.artifact_version_id"), nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    stale_reason = Column(JSON, nullable=True)
 
 
 class ResourceRevisionModel(Base):
@@ -478,6 +479,14 @@ class AgentTrialRunModel(Base):
     budget = Column(JSON, nullable=False, default=dict)
     status = Column(String(32), nullable=False, default="completed")
     failure_owner = Column(String(128), nullable=True)
+    # The Studio trial is an authoring record, but its execution must remain
+    # attributable to the exact durable runtime attempt it exercised.  These
+    # links allow a typed RequestInput to pause/resume that attempt after a
+    # browser refresh without re-running a different draft.
+    runtime_run_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    runtime_node_run_id = Column(UUID(as_uuid=True), nullable=True)
+    runtime_attempt_id = Column(UUID(as_uuid=True), nullable=True)
+    runtime_agent_revision_id = Column(UUID(as_uuid=True), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
@@ -730,6 +739,27 @@ class NodeDefinitionModel(Base):
         onupdate=datetime.utcnow,
         nullable=False,
     )
+
+
+class ApprovedNodePackageModel(Base):
+    __tablename__ = "approved_node_packages"
+    package_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    revision_id = Column(UUID(as_uuid=True), ForeignKey("node_definitions.revision_id"), unique=True, nullable=False)
+    content_hash = Column(String(128), nullable=False)
+    signer_id = Column(String(255), nullable=False)
+    signature = Column(String(256), nullable=False)
+    approval_id = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class NodeContractTestRunModel(Base):
+    __tablename__ = "node_contract_test_runs"
+    run_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    revision_id = Column(UUID(as_uuid=True), ForeignKey("node_definitions.revision_id"), nullable=False, index=True)
+    case_name = Column(String(64), nullable=False)
+    passed = Column(Boolean, nullable=False)
+    evidence = Column(JSON, default=dict, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
 class ConverterRevisionModel(Base):

@@ -1,14 +1,15 @@
 """HTTP contract for signed AtlasCloud callbacks (TF-WF-006)."""
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import os
+import time
 from uuid import uuid4
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from sqlalchemy import select
 
 from src.domain.runtime.runtime_service import RuntimeService
@@ -31,7 +32,7 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.asyncio
-async def test_atlas_callback_hmac_unknown_and_duplicate_are_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_atlas_callback_ed25519_unknown_and_duplicate_are_safe(monkeypatch: pytest.MonkeyPatch) -> None:
     """Only a signed callback for a durable task binding can publish once."""
     factory = get_session_factory()
     workflow_id, revision_id, owner_id = uuid4(), uuid4(), uuid4()
@@ -56,19 +57,32 @@ async def test_atlas_callback_hmac_unknown_and_duplicate_are_safe(monkeypatch: p
     # Delayed import isolates the runtime PG module from the full composition
     # root during collection; ASGITransport exercises actual HTTP middleware.
     from src.app import app
-    from src.core.config import settings
-    monkeypatch.setattr(settings, "atlascloud_webhook_secret", "callback-test-secret")
-    payload = {"task_id": task_id, "status": "completed", "outputs": [{"text": "ok"}], "model_version": "test"}
+    from src.domain.provider.atlascloud import AtlasWebhookVerifier
+    payload = {
+        "session_id": task_id, "event_type": "prediction.updated", "status": "OK",
+        "payload": {"status": "completed", "outputs": [{"text": "ok"}], "model_version": "test"},
+    }
     raw = json.dumps(payload).encode()
-    signed = hmac.new(b"callback-test-secret", raw, hashlib.sha256).hexdigest()
-    unknown_raw = json.dumps({**payload, "task_id": "unknown-task"}).encode()
-    unknown_signed = hmac.new(b"callback-test-secret", unknown_raw, hashlib.sha256).hexdigest()
+    private = Ed25519PrivateKey.generate()
+    public = private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    monkeypatch.setattr(AtlasWebhookVerifier, "_load_keys", classmethod(lambda cls, **_kwargs: {"test-kid": public}))
+    timestamp = str(int(time.time()))
+    signed = __import__("base64").urlsafe_b64encode(private.sign(timestamp.encode() + b"." + raw)).decode().rstrip("=")
+    unknown_payload = {**payload, "session_id": "unknown-task"}
+    unknown_raw = json.dumps(unknown_payload).encode()
+    unknown_signed = __import__("base64").urlsafe_b64encode(private.sign(timestamp.encode() + b"." + unknown_raw)).decode().rstrip("=")
+    headers = {
+        "X-AtlasCloud-Webhook-Id": task_id, "X-AtlasCloud-Event": "prediction.updated",
+        "X-AtlasCloud-Timestamp": timestamp, "X-AtlasCloud-Signature-Ed25519": signed,
+        "X-AtlasCloud-Key-Id": "test-kid",
+    }
+    unknown_headers = {**headers, "X-AtlasCloud-Webhook-Id": "unknown-task", "X-AtlasCloud-Signature-Ed25519": unknown_signed}
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://toonflow.test") as client:
-        assert (await client.post("/api/v1/runtime/callbacks/atlascloud", content=raw, headers={"X-Atlas-Signature": "wrong"})).status_code == 401
-        assert (await client.post("/api/v1/runtime/callbacks/atlascloud", content=unknown_raw, headers={"X-Atlas-Signature": unknown_signed})).status_code == 404
-        assert (await client.post("/api/v1/runtime/callbacks/atlascloud", content=raw, headers={"X-Atlas-Signature": signed})).status_code == 200
-        assert (await client.post("/api/v1/runtime/callbacks/atlascloud", content=raw, headers={"X-Atlas-Signature": signed})).status_code == 200
+        assert (await client.post("/api/v1/runtime/callbacks/atlascloud", content=raw, headers={**headers, "X-AtlasCloud-Signature-Ed25519": "wrong"})).status_code == 401
+        assert (await client.post("/api/v1/runtime/callbacks/atlascloud", content=unknown_raw, headers=unknown_headers)).status_code == 404
+        assert (await client.post("/api/v1/runtime/callbacks/atlascloud", content=raw, headers=headers)).status_code == 200
+        assert (await client.post("/api/v1/runtime/callbacks/atlascloud", content=raw, headers=headers)).status_code == 200
     with factory() as session:
         records = list(session.scalars(select(ProviderInvocationRecordModel).where(ProviderInvocationRecordModel.provider_attempt_id == provider.provider_attempt_id)))
         assert len(records) == 1

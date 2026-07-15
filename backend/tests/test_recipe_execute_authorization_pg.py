@@ -17,6 +17,8 @@ from src.infra.db.models import (
     NodeRunAttemptModel,
     NodeRunModel,
     ProviderInvocationAttemptModel,
+    ProviderInvocationRecordModel,
+    WorkflowTaskBindingModel,
     WorkflowRevisionModel,
     WorkflowRunModel,
 )
@@ -142,3 +144,44 @@ async def test_recipe_execute_uses_parent_frozen_inputs_not_browser_inputs(monke
     })
     assert response.status_code == 200
     assert captured["payload"] == {"input": {"prompt": "fixed"}, "parameters": {}}
+
+
+@pytest.mark.asyncio
+async def test_recipe_async_submission_binds_prediction_and_waits_for_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Media ACKs are not outputs: only polling/callback may publish them."""
+    import src.api.routes.recipe as route
+    task_id = f"atlas-prediction-{uuid4()}"
+
+    class AsyncAdapter:
+        configured = True
+
+        def submit(self, **_kwargs: object) -> AtlasSubmission:
+            return AtlasSubmission(
+                task_id=task_id, model_version="atlas/image",
+                outputs=[], usage={}, actual_cost=0.0, raw_fingerprint="test",
+                asynchronous=True,
+            )
+
+    monkeypatch.setattr(route, "AtlasCloudAdapter", AsyncAdapter)
+    owner_id, token = await _identity()
+    owner_scope = f"user:{owner_id}"
+    revision, frozen_body = _frozen_recipe(owner_scope)
+    parent = _parent(owner_scope, recipe_revision_id=revision)
+    response = await _request("POST", "/api/v1/recipes/execute", headers={"Authorization": f"Bearer {token}"}, json={
+        "node_run_attempt_id": str(parent), "recipe_revision_id": str(revision),
+        "idempotency_key": str(uuid4()), "inputs": {}, "body": frozen_body,
+    })
+    assert response.status_code == 200
+    result = response.json()
+    assert result["status"] == "submitted" and result["provider_task_id"] == task_id
+    with get_session_factory()() as session:
+        parent_attempt = session.get(NodeRunAttemptModel, parent)
+        provider = session.get(ProviderInvocationAttemptModel, UUID(result["provider_attempt_id"]))
+        binding = session.scalar(select(WorkflowTaskBindingModel).where(
+            WorkflowTaskBindingModel.provider_attempt_id == provider.provider_attempt_id,
+        )) if provider is not None else None
+        assert parent_attempt is not None and parent_attempt.status == AttemptStatus.WAITING_EXTERNAL
+        assert provider is not None and binding is not None and binding.provider_task_id == task_id
+        assert session.scalar(select(func.count()).select_from(ProviderInvocationRecordModel).where(
+            ProviderInvocationRecordModel.provider_attempt_id == provider.provider_attempt_id,
+        )) == 0

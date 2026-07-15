@@ -6,7 +6,7 @@ from __future__ import annotations
 import uuid
 import pytest
 
-from src.domain.workflow.compiler import WorkflowCompiler, CompilationError
+from src.domain.workflow.compiler import CompilationContext, WorkflowCompiler, CompilationError
 from src.schemas.models import RegistrySnapshot, NodeDefinitionRevision, PortTypeRef
 
 
@@ -182,6 +182,49 @@ class TestCompiler:
         assert passes is False
         assert len(diagnostics) > 0
 
+    def test_context_freezes_provider_policy_and_capability_snapshot(self, compiler, registry):
+        context = CompilationContext(
+            actor_scope="user:00000000-0000-0000-0000-000000000001",
+            provider_selection_policy_ref="atlascloud.policy.r7",
+            policy_revision="policy.r7",
+            capability_snapshot_ref="atlascloud.capability.r7",
+            available_capabilities=("atlascloud.llm",),
+        )
+        plan = compiler.compile(
+            workflow_revision_id=uuid.uuid4(), graph={"nodes": [{"id": "n1", "type": "brief"}], "edges": []},
+            registry_snapshot=registry, compilation_context=context,
+        )
+        assert plan.provider_policy_ref == "atlascloud.policy.r7"
+        assert "atlascloud.capability.r7" in plan.capability_snapshots
+        assert "policy.r7" in plan.policy_revisions
+        assert plan.actor_scope == context.actor_scope
+        assert plan.entitlement_snapshot == {}
+
+    def test_unavailable_frozen_executor_has_explicit_replay_migration_diagnostic(self, compiler, registry):
+        registry.node_definitions["brief"].executor_ref = "workflow.legacy.brief.v1"
+        with pytest.raises(CompilationError) as error:
+            compiler.compile(
+                workflow_revision_id=uuid.uuid4(), graph={"nodes": [{"id": "n1", "type": "brief"}], "edges": []},
+                registry_snapshot=registry,
+                compilation_context=CompilationContext(actor_scope="user:one", executor_availability={"workflow.legacy.brief.v1": False}),
+            )
+        diagnostic = error.value.details["diagnostics"][0]
+        assert diagnostic["code"] == "WF_EXECUTOR_REPLAY_UNAVAILABLE"
+        assert diagnostic["node_instance_id"] == "n1"
+        assert "Create a new WorkflowRevision" in diagnostic["remediation"]
+
+    def test_port_and_config_diagnostics_expose_structured_targets(self, compiler, registry):
+        registry.node_definitions["brief"].config_schema = {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]}
+        with pytest.raises(CompilationError) as error:
+            compiler.compile(
+                workflow_revision_id=uuid.uuid4(),
+                graph={"nodes": [{"id": "n1", "type": "brief", "config": {}}], "edges": []}, registry_snapshot=registry,
+            )
+        diagnostic = error.value.details["diagnostics"][0]
+        assert diagnostic["node_instance_id"] == "n1"
+        assert diagnostic["config_path"] == "prompt"
+        assert diagnostic["safe_message"]
+
     def test_port_compatibility(self, compiler):
         """FR-2: Port type compatibility"""
         source = PortTypeRef(port_id="out", type_id="artifact", schema_id="creative_brief", schema_version=1, cardinality="required")
@@ -214,7 +257,37 @@ class TestCompiler:
         nodes = plan.resolved_graph["nodes"]
         assert [node["type"] for node in nodes] == ["agent_invoke", "workbench_task", "resource_commit"]
         assert all(node["data"]["owner_layer"] == "workflow" for node in nodes)
+        assert all(node["data"]["managed_task_plan_owner_workflow_revision_id"] == str(plan.workflow_revision_id) for node in nodes)
         assert len(plan.resolved_graph["edges"]) == 2
+
+    def test_managed_agent_card_rejects_non_workflow_task_owner(self, compiler, registry):
+        with pytest.raises(CompilationError):
+            compiler.compile(
+                workflow_revision_id=uuid.uuid4(),
+                graph={"nodes": [{"id": "managed", "type": "brief", "data": {"managed_task_plan": [
+                    {"kind": "workbench_task", "owner_layer": "agent"},
+                ]}}], "edges": []},
+                registry_snapshot=registry,
+            )
+
+    def test_registered_managed_task_plan_is_compiler_owned(self, compiler, registry):
+        pinned = str(uuid.uuid4())
+        registry.node_definitions["brief"].managed_agent_task_plan = [
+            {"kind": "agent_invoke", "agent_revision_id": pinned},
+            {"kind": "human_gate"},
+        ]
+        plan = compiler.compile(
+            workflow_revision_id=uuid.uuid4(),
+            graph={"nodes": [{"id": "managed", "type": "brief", "data": {}}], "edges": []},
+            registry_snapshot=registry,
+        )
+        assert [node["type"] for node in plan.resolved_graph["nodes"]] == ["agent_invoke", "human_gate"]
+        with pytest.raises(CompilationError):
+            compiler.compile(
+                workflow_revision_id=uuid.uuid4(),
+                graph={"nodes": [{"id": "managed", "type": "brief", "data": {"managed_task_plan": [{"kind": "human_gate"}]}}], "edges": []},
+                registry_snapshot=registry,
+            )
 
     def test_managed_agent_card_rejects_unpinned_agent(self, compiler, registry):
         with pytest.raises(CompilationError):

@@ -14,11 +14,12 @@ from src.core.exceptions import ConflictError, ForbiddenError, NotFoundError, Va
 from src.infra.db.models import (
     ArtifactVersionModel, CandidateSetModel, HumanTaskDecisionModel, HumanTaskModel,
     NodeRunAttemptModel, NodeRunModel, ResourceCommitModel, SelectionRecordModel,
-    ResourceDraftModel, ResourceModel, ResourceRevisionModel,
-    WorkflowRevisionModel, WorkflowRunModel,
+    ResourceDraftModel, ResourceGrantSnapshotModel, ResourceModel, ResourceRevisionModel,
+    WorkflowRevisionModel, WorkflowRunModel, CompiledExecutionPlanModel,
+    ProviderInvocationAttemptModel, ProviderInvocationRecordModel, ProviderOutputBindingModel,
 )
 from src.infra.db.session import get_session_factory
-from src.schemas.enums import AttemptStatus, HumanTaskStatus, NodeRunStatus, RunStatus
+from src.schemas.enums import AttemptStatus, HumanTaskStatus, NodeRunStatus
 
 
 BUSINESS_NODE_CATALOG: tuple[dict[str, Any], ...] = (
@@ -87,6 +88,42 @@ class BusinessNodeService:
             s.add(row)
             s.flush()
             return row
+
+    @staticmethod
+    def _frozen_atlas_outputs(session: Session, *, inputs: dict[str, Any], owner_scope: str) -> tuple[list[ArtifactVersionModel], list[ProviderInvocationRecordModel]]:
+        """Resolve only immutable AtlasCloud outputs already bound to a run.
+
+        Business nodes never manufacture model results from node configuration.
+        Their candidate/review inputs must have traversed the provider outbox,
+        record and OutputBinding chain first.
+        """
+        raw_refs = inputs.get("upstream_artifact_refs", [])
+        artifact_ids: list[UUID] = []
+        if isinstance(raw_refs, list):
+            for ref in raw_refs:
+                if isinstance(ref, dict) and isinstance(ref.get("artifact_version_ids"), list):
+                    for value in ref["artifact_version_ids"]:
+                        try:
+                            artifact_ids.append(UUID(str(value)))
+                        except (TypeError, ValueError) as exc:
+                            raise ValidationError_("Frozen provider output reference is invalid") from exc
+        if not artifact_ids:
+            raise ValidationError_("Business node requires frozen AtlasCloud output bindings")
+        artifacts: list[ArtifactVersionModel] = []
+        records: list[ProviderInvocationRecordModel] = []
+        for artifact_id in artifact_ids:
+            binding = session.scalar(select(ProviderOutputBindingModel).where(
+                ProviderOutputBindingModel.output_artifact_version_id == artifact_id,
+            ).order_by(ProviderOutputBindingModel.output_index).limit(1))
+            record = session.get(ProviderInvocationRecordModel, binding.record_id) if binding else None
+            invocation = session.get(ProviderInvocationAttemptModel, record.provider_attempt_id) if record else None
+            artifact = session.get(ArtifactVersionModel, artifact_id)
+            if artifact is None or artifact.owner_scope != owner_scope or record is None or invocation is None or record.provider_id != "atlascloud" or invocation.provider_id != "atlascloud":
+                raise ValidationError_("Business node requires owner-scoped AtlasCloud OutputBinding")
+            artifacts.append(artifact)
+            if all(existing.record_id != record.record_id for existing in records):
+                records.append(record)
+        return artifacts, records
 
     @staticmethod
     def _artifact(
@@ -188,8 +225,11 @@ class BusinessNodeService:
                 self._validate_json_schema(value, schema)
                 outputs.append(self._artifact(s, owner_scope=run.owner_scope, schema_id=str(config.get("schema_id", "typed_generated")), content=value if isinstance(value, dict) else {"value": value}, run_id=run.run_id))
             elif kind == "model_router":
-                policy = config.get("provider_selection_policy_ref")
-                models = config.get("enabled_models", [])
+                plan_row = s.get(CompiledExecutionPlanModel, run.compiled_plan_id)
+                plan_json = dict(plan_row.plan_json or {}) if plan_row is not None else {}
+                policy = plan_json.get("provider_policy_ref")
+                limits = plan_json.get("budget_limits", {})
+                models = limits.get("enabled_atlascloud_models", []) if isinstance(limits, dict) else []
                 if (
                     not isinstance(policy, str)
                     or not policy.startswith("atlascloud.")
@@ -197,12 +237,10 @@ class BusinessNodeService:
                     or not models
                     or any(not isinstance(model, str) or not model.startswith("atlascloud/") for model in models)
                 ):
-                    raise ValidationError_("Model Router requires an enabled fixed AtlasCloud policy/model set")
-                outputs.append(self._artifact(s, owner_scope=run.owner_scope, schema_id="provider_selection", content={"policy_ref": policy, "models": models}, run_id=run.run_id))
+                    raise ValidationError_("Model Router requires a frozen compiled AtlasCloud policy/model set")
+                outputs.append(self._artifact(s, owner_scope=run.owner_scope, schema_id="provider_selection", content={"policy_ref": policy, "models": models, "compiled_plan_id": str(run.compiled_plan_id)}, run_id=run.run_id))
             elif kind == "variants":
-                payloads = config.get("candidate_payloads", [])
-                if not isinstance(payloads, list) or not payloads:
-                    raise ValidationError_("Variants requires one or more candidate payloads")
+                candidate_outputs, records = self._frozen_atlas_outputs(s, inputs=inputs, owner_scope=run.owner_scope)
                 raw_failed = list(config.get("failed_candidates", []))
                 if any(
                     not isinstance(item, dict)
@@ -221,15 +259,12 @@ class BusinessNodeService:
                     }
                     for item in raw_failed
                 ]
-                costs = dict(config.get("cost_allocation", {}))
-                if any(not isinstance(value, (int, float)) or value < 0 for value in costs.values()):
-                    raise ValidationError_("Variants cost_allocation must contain non-negative numeric amounts")
-                candidate_outputs = [self._artifact(s, owner_scope=run.owner_scope, schema_id=str(config.get("candidate_schema_id", "variant")), content=item if isinstance(item, dict) else {"value": item}, run_id=run.run_id) for item in payloads]
+                costs = {str(record.record_id): record.actual_cost for record in records}
                 refs = [{"artifact_id": str(item.artifact_id), "artifact_version_id": str(item.artifact_version_id), "schema_id": item.schema_id, "schema_version": item.schema_version} for item in candidate_outputs]
                 candidate_set = CandidateSetModel(candidate_set_id=uuid4(), owner_scope=run.owner_scope, run_id=run.run_id, node_run_id=node.node_run_id, candidate_refs=refs, failed_candidates=failed, cost_allocation=costs, created_at=datetime.now(timezone.utc))
                 s.add(candidate_set)
                 outputs.extend(candidate_outputs)
-                outputs.append(self._artifact(s, owner_scope=run.owner_scope, schema_id="candidate_set", content={"candidate_set_id": str(candidate_set.candidate_set_id), "candidate_refs": refs, "failed_candidates": failed}, run_id=run.run_id))
+                outputs.append(self._artifact(s, owner_scope=run.owner_scope, schema_id="candidate_set", content={"candidate_set_id": str(candidate_set.candidate_set_id), "candidate_refs": refs, "failed_candidates": failed, "provider_record_ids": [str(record.record_id) for record in records], "cost_allocation": costs}, run_id=run.run_id))
             elif kind == "select_rank":
                 raw = config.get("candidate_set_id")
                 candidate_set = s.get(CandidateSetModel, UUID(str(raw))) if raw else None
@@ -255,10 +290,9 @@ class BusinessNodeService:
                 s.add(record)
                 outputs.append(self._artifact(s, owner_scope=run.owner_scope, schema_id="selection_record", content={"selection_id": str(record.selection_id), "selected_refs": record.selected_refs, "ranking": ranking}, run_id=run.run_id))
             elif kind == "review":
-                issues = config.get("issues", [])
-                if not isinstance(issues, list) or any(not isinstance(item, dict) for item in issues):
-                    raise ValidationError_("Review requires typed issue objects")
-                outputs.append(self._artifact(s, owner_scope=run.owner_scope, schema_id="review_report", content={"issues": issues, "rubric_revision": str(config.get("rubric_revision", "review.v1"))}, run_id=run.run_id))
+                reviewed, records = self._frozen_atlas_outputs(s, inputs=inputs, owner_scope=run.owner_scope)
+                outputs.append(self._artifact(s, owner_scope=run.owner_scope, schema_id="review_report", content={"reviewed_artifact_version_ids": [str(item.artifact_version_id) for item in reviewed], "provider_record_ids": [str(record.record_id) for record in records], "actual_cost": sum(record.actual_cost for record in records)}, run_id=run.run_id,
+                    input_refs=[{"artifact_id": str(item.artifact_id), "artifact_version_id": str(item.artifact_version_id), "schema_id": item.schema_id, "schema_version": item.schema_version} for item in reviewed]))
             elif kind == "transform":
                 transform_id = config.get("transform_id", "identity")
                 if transform_id not in {"identity", "metadata_extract"}:
@@ -276,21 +310,32 @@ class BusinessNodeService:
                     # fixed outputs from this run, never an owner's latest
                     # artifact collection.
                     artifact_ids = [UUID(str(item["artifact_version_id"])) for item in inputs.get("upstream_artifact_refs", []) if isinstance(item, dict) and item.get("artifact_version_id")]
-                if not artifact_ids:
-                    raise ValidationError_("Package Export requires fixed artifact refs")
+                resource_refs = config.get("resource_refs", inputs.get("resource_refs", []))
+                if not isinstance(resource_refs, list):
+                    raise ValidationError_("Package Export config.resource_refs must be a list")
+                if not artifact_ids and not resource_refs:
+                    raise ValidationError_("Package Export requires fixed ArtifactRef or ResourceRef inputs")
                 manifest: list[dict[str, Any]] = []
                 for artifact_id in artifact_ids:
                     artifact = s.get(ArtifactVersionModel, artifact_id)
                     if artifact is None or artifact.owner_scope != run.owner_scope:
                         raise ForbiddenError("Package Export has an unavailable ArtifactVersion")
                     manifest.append({"artifact_version_id": str(artifact_id), "schema_id": artifact.schema_id, "attribution": artifact.metadata_json.get("attribution", {})})
+                for index, raw_ref in enumerate(resource_refs):
+                    manifest.append(self._resolve_export_resource_ref(
+                        s, raw_ref=raw_ref, requester_scope=run.owner_scope, index=index,
+                    ))
                 outputs.append(self._artifact(s, owner_scope=run.owner_scope, schema_id="package_manifest", content={"items": manifest, "attribution": config.get("attribution", {})}, run_id=run.run_id))
             elif kind == "workbench_task":
                 existing = s.scalar(select(HumanTaskModel).where(HumanTaskModel.node_run_id == node.node_run_id, HumanTaskModel.task_kind == "workbench_task"))
                 if existing is None:
                     task = HumanTaskModel(task_id=uuid4(), task_kind="workbench_task", owner_layer="workflow", owner_revision_id=revision.revision_id, run_id=run.run_id, node_run_id=node.node_run_id, attempt_id=attempt.attempt_id, input_snapshot_refs=list(config.get("input_snapshot_refs", [])), policy_strength="domain_required", schema_ref=str(config.get("output_schema_ref", "workbench_result.v1")), timeout_policy={"target_workbench": str(config.get("target_workbench", "generic")), "resource_type": str(config.get("resource_type", "generic")), "expected_draft_version": int(config.get("expected_draft_version", 0))}, status=HumanTaskStatus.PENDING, task_version=1, created_at=datetime.now(timezone.utc))
                     s.add(task)
-                attempt.status, node.status, run.status = AttemptStatus.WAITING_EXTERNAL, NodeRunStatus.WAITING_USER, RunStatus.WAITING_USER
+                attempt.status, node.status = AttemptStatus.WAITING_EXTERNAL, NodeRunStatus.WAITING_USER
+                # A WorkbenchTask pauses only its own branch. A parallel
+                # READY/RUNNING node must keep the aggregate run RUNNING.
+                from src.domain.runtime.runtime_service import RuntimeService
+                RuntimeService(session_factory=self._factory)._sql_aggregate_run(s, run)
                 s.flush()
                 return []
             else:
@@ -303,6 +348,54 @@ class BusinessNodeService:
             RuntimeService(session_factory=self._factory)._sql_schedule_ready(s, run)
             s.flush()
             return outputs
+
+    @staticmethod
+    def _resolve_export_resource_ref(
+        session: Session, *, raw_ref: Any, requester_scope: str, index: int,
+    ) -> dict[str, Any]:
+        """Resolve a fixed ResourceRef and its current cross-owner grant."""
+        path = f"config.resource_refs[{index}]"
+        if not isinstance(raw_ref, dict):
+            raise ValidationError_(f"Package Export {path} must be a ResourceRef")
+        try:
+            resource_id = UUID(str(raw_ref["resource_id"]))
+            revision_id = UUID(str(raw_ref["revision_id"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValidationError_(f"Package Export {path} requires fixed resource_id and revision_id") from exc
+        resource = session.get(ResourceModel, resource_id)
+        revision = session.get(ResourceRevisionModel, revision_id)
+        if resource is None or revision is None or revision.resource_id != resource_id:
+            raise NotFoundError("Package Export ResourceRef", f"{path}:{revision_id}")
+        if revision.revision_status.value != "active":
+            raise ForbiddenError(f"Package Export {path} references a non-active ResourceRevision")
+        declared_type = raw_ref.get("resource_type")
+        if declared_type is not None and str(declared_type) != resource.resource_type:
+            raise ValidationError_(f"Package Export {path} resource_type does not match the fixed ResourceRevision")
+        grant_id: UUID | None = None
+        if resource.owner_scope != requester_scope:
+            try:
+                grant_id = UUID(str(raw_ref["grant_snapshot_id"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ForbiddenError(f"Package Export {path} requires a current GrantSnapshot for cross-owner ResourceRef") from exc
+            grant = session.get(ResourceGrantSnapshotModel, grant_id)
+            if (
+                grant is None or grant.resource_revision_id != revision_id
+                or grant.grantee_scope != requester_scope or grant.status != "active"
+                or "reference" not in set(grant.capability_actions or [])
+            ):
+                raise ForbiddenError(f"Package Export {path} has no current entitlement for ResourceRef")
+        artifact = session.get(ArtifactVersionModel, revision.content_artifact_version_id)
+        if artifact is None:
+            raise ConflictError(f"Package Export {path} has no canonical content ArtifactVersion")
+        return {
+            "resource_ref": {
+                "resource_id": str(resource_id), "resource_type": resource.resource_type,
+                "revision_id": str(revision_id), "grant_snapshot_id": str(grant_id) if grant_id else None,
+            },
+            "content_artifact_version_id": str(revision.content_artifact_version_id),
+            "schema_id": artifact.schema_id,
+            "attribution": artifact.metadata_json.get("attribution", {}),
+        }
 
     def create_workbench_task(
         self, *, owner_scope: str, workflow_revision_id: UUID, run_id: UUID, node_run_id: UUID, attempt_id: UUID,
@@ -333,7 +426,8 @@ class BusinessNodeService:
             s.add(task)
             attempt.status = AttemptStatus.WAITING_EXTERNAL
             node.status = NodeRunStatus.WAITING_USER
-            run.status = RunStatus.WAITING_USER
+            from src.domain.runtime.runtime_service import RuntimeService
+            RuntimeService(session_factory=self._factory)._sql_aggregate_run(s, run)
             s.flush()
             return task
 
@@ -416,14 +510,18 @@ class BusinessNodeService:
                 ]
                 attempt.fixed_input = fixed_input
                 attempt.status = AttemptStatus.COMPLETED
-            if run.status == RunStatus.WAITING_USER:
-                run.status = RunStatus.RUNNING
             # ResourceRefs become visible only after the CAS/revision/commit
             # writes above are in this transaction.  Then schedule downstream
             # nodes against the same durable run snapshot.
             s.flush()
             from src.domain.runtime.runtime_service import RuntimeService
 
-            RuntimeService(session_factory=self._factory)._sql_schedule_ready(s, run)
+            runtime = RuntimeService(session_factory=self._factory)
+            # Completing the task may be the only waiting branch. Aggregate
+            # first so the cancellation fence sees a runnable RunStatus, then
+            # materialise its newly-ready downstream closure.
+            runtime._sql_aggregate_run(s, run)
+            runtime._sql_schedule_ready(s, run)
+            runtime._sql_aggregate_run(s, run)
             s.flush()
             return commits

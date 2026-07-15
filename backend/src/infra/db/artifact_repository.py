@@ -20,6 +20,26 @@ from src.infra.db.session import get_session_factory
 from src.schemas.models import ArtifactRef, OwnerScope
 
 
+def _canonical_lineage(raw_refs: list[dict[str, Any]] | None, *, created_by_run_id: uuid.UUID | None) -> list[dict[str, Any]]:
+    """Keep legacy refs readable while requiring stable lineage semantics."""
+    result: list[dict[str, Any]] = []
+    for order, raw in enumerate(raw_refs or []):
+        if not isinstance(raw, dict):
+            raise ValidationError_("lineage ref 必须是对象")
+        source = raw.get("source_ref") if isinstance(raw.get("source_ref"), dict) else {
+            key: value for key, value in raw.items()
+            if key in {"artifact_id", "artifact_version_id", "node_run_attempt_id", "map_item_id", "tool_invocation_id", "resource_revision_id"}
+        }
+        if not source:
+            raise ValidationError_("lineage ref 必须声明固定 source_ref")
+        raw_producer = raw.get("producer")
+        producer: dict[str, Any] = dict(raw_producer) if isinstance(raw_producer, dict) else {}
+        if created_by_run_id and "run_id" not in producer:
+            producer = {**producer, "run_id": str(created_by_run_id)}
+        result.append({"source_ref": source, "role": str(raw.get("role", "input")), "order": int(raw.get("order", order)), "producer": producer, "transformation": raw.get("transformation", {})})
+    return result
+
+
 class SqlArtifactRepository:
     """Persistent artifact storage with cross-owner enforcement."""
 
@@ -87,7 +107,7 @@ class SqlArtifactRepository:
                 content_json=content_json or {},
                 content_hash=content_hash,
                 created_by_run_id=created_by_run_id,
-                lineage_input_refs=lineage_input_refs or [],
+                lineage_input_refs=_canonical_lineage(lineage_input_refs, created_by_run_id=created_by_run_id),
                 blob_uri=blob_uri if blob_uri is not None else content_uri,
                 metadata_json=metadata,
                 created_at=datetime.now(timezone.utc),
@@ -194,3 +214,13 @@ class SqlArtifactRepository:
                 )
             ).all()
             return list(downstream)
+
+    def assert_blob_mutation_allowed(self, blob_uri: str, owner_scope: OwnerScope) -> None:
+        """Prevent delete/archive/migration from orphaning canonical refs."""
+        with self._factory() as session:
+            referenced = session.scalar(select(ArtifactVersionModel.artifact_version_id).where(
+                ArtifactVersionModel.owner_scope == owner_scope.scoped_id,
+                ArtifactVersionModel.blob_uri == blob_uri,
+            ).limit(1))
+            if referenced is not None:
+                raise ValidationError_("Blob 仍被有效 ArtifactVersion 引用，禁止破坏性操作", details={"artifact_version_id": str(referenced)})

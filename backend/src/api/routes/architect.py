@@ -6,7 +6,7 @@ from uuid import UUID
 from uuid import uuid4
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
-from src.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationError_
+from src.core.exceptions import ConflictError, ForbiddenError, NotFoundError, PolicyBlockedError, ValidationError_
 from src.domain.agent.architect_service import ArchitectService
 from src.api.auth import require_owner
 from src.core.config import settings
@@ -27,7 +27,6 @@ class CreateProposalRequest(BaseModel):
     workflow_id: UUID
     base_draft_hash: str
     intent: str
-    node_run_attempt_id: UUID
 
 
 class ApplyProposalRequest(BaseModel):
@@ -60,8 +59,8 @@ async def create_test_fixture_proposal(body: FixtureProposalRequest, authorizati
 @router.post("/proposals", status_code=201)
 async def create_proposal(body: CreateProposalRequest, authorization: str | None = Header(None)) -> dict:
     try:
-        return _architect.generate(owner_scope=require_owner(authorization)[1].scoped_id, **body.model_dump())
-    except (ConflictError, NotFoundError, ValidationError_) as exc:
+        return _architect.generate_from_intent(owner_scope=require_owner(authorization)[1].scoped_id, **body.model_dump())
+    except (ConflictError, NotFoundError, PolicyBlockedError, ValidationError_) as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.to_dict())
 
 

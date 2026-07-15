@@ -29,6 +29,7 @@ from .draft_revision import (
     create_draft,
     create_revision,
     normalize_graph_and_layout,
+    required_human_gate_ids,
 )
 
 
@@ -138,35 +139,46 @@ class SqlWorkflowService:
             graph, config, layout, pinned_dependency_revisions
         )
         now = datetime.now(timezone.utc)
-        # The expected hash is part of the UPDATE predicate, so concurrent saves
-        # cannot both succeed under PostgreSQL's row locking semantics.
-        statement = (
-            update(WorkflowDraftModel)
-            .where(
-                WorkflowDraftModel.workflow_id == workflow_id,
-                WorkflowDraftModel.graph_hash == base_graph_hash,
-            )
-            .values(
-                draft_version=WorkflowDraftModel.draft_version + 1,
-                graph=graph,
-                config=config,
-                layout=layout,
-                graph_hash=graph_hash,
-                layout_hash=layout_hash,
-                execution_hash=execution_hash,
-                updated_at=now,
-            )
-        )
         with self._factory.begin() as session:
-            result = session.execute(statement)
-            if result.rowcount != 1:
-                if session.get(WorkflowModel, workflow_id) is None:
-                    raise NotFoundError("Workflow", str(workflow_id))
+            # Lock before evaluating both CAS and the mandatory-Gate invariant.
+            # This keeps an Architect Patch on the same boundary as a manual
+            # canvas save and avoids a check-then-write race.
+            model = session.execute(
+                select(WorkflowDraftModel)
+                .where(WorkflowDraftModel.workflow_id == workflow_id)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if model is None:
+                self._raise_workflow_or_draft_not_found(session, workflow_id)
+            assert model is not None
+            if model.graph_hash != base_graph_hash:
                 raise ConflictError(
                     message=f"WorkflowDraft {workflow_id} 冲突: base_hash {base_graph_hash} 不匹配当前版本"
                 )
-            model = session.get(WorkflowDraftModel, workflow_id)
-            assert model is not None
+            protected = required_human_gate_ids(model.graph or {})
+            active_graphs = session.scalars(
+                select(WorkflowRevisionModel.graph).where(
+                    WorkflowRevisionModel.workflow_id == workflow_id,
+                    WorkflowRevisionModel.revision_status == RevisionStatus.ACTIVE,
+                )
+            )
+            for active_graph in active_graphs:
+                protected.update(required_human_gate_ids(active_graph or {}))
+            removed = protected - required_human_gate_ids(graph)
+            if removed:
+                raise ConflictError(
+                    "domain_required 或 policy_required Human Gate 不得从 Draft 或 Patch 删除",
+                    details={"required_gate_node_ids": sorted(removed)},
+                )
+            model.draft_version += 1
+            model.graph = graph
+            model.config = config
+            model.layout = layout
+            model.graph_hash = graph_hash
+            model.layout_hash = layout_hash
+            model.execution_hash = execution_hash
+            model.updated_at = now
+            session.flush()
             return _to_draft(model)
 
     def create_revision_from_draft(self, workflow_id: UUID, registry_snapshot_id: UUID) -> WorkflowRevision:
@@ -215,7 +227,15 @@ class SqlWorkflowService:
             )
             return revision
 
-    def publish_compiled_revision(self, workflow_id: UUID, registry: RegistrySnapshot, compiler: Any) -> tuple[WorkflowRevision, CompiledExecutionPlan]:
+    def publish_compiled_revision(
+        self,
+        workflow_id: UUID,
+        registry: RegistrySnapshot,
+        compiler: Any,
+        *,
+        graph_override: dict[str, Any] | None = None,
+        compilation_context: Any | None = None,
+    ) -> tuple[WorkflowRevision, CompiledExecutionPlan]:
         """Atomically activate only a Draft that the compiler has accepted.
 
         The compiler is pure; its result is persisted with the immutable revision
@@ -227,9 +247,23 @@ class SqlWorkflowService:
                 self._raise_workflow_or_draft_not_found(session, workflow_id)
             assert draft_model is not None
             draft = _to_draft(draft_model)
+            # A Draft may intentionally contain latest_at_compile references.
+            # Its frozen Revision must not. The route resolves the graph under
+            # the authenticated owner before entering this transaction.
+            if graph_override is not None:
+                from .draft_revision import compute_draft_hashes, normalize_graph_and_layout
+                graph, layout = normalize_graph_and_layout(graph_override, draft.layout)
+                graph_hash, layout_hash, execution_hash = compute_draft_hashes(graph, draft.config, layout)
+                draft = draft.model_copy(update={
+                    "graph": graph, "layout": layout, "graph_hash": graph_hash,
+                    "layout_hash": layout_hash, "execution_hash": execution_hash,
+                })
             last = session.scalar(select(WorkflowRevisionModel.revision_number).where(WorkflowRevisionModel.workflow_id == workflow_id).order_by(WorkflowRevisionModel.revision_number.desc()).limit(1)) or 0
             revision = create_revision(workflow_id=workflow_id, draft=draft, registry_snapshot_id=registry.snapshot_id, revision_number=last + 1)
-            plan = compiler.compile(workflow_revision_id=revision.revision_id, graph=draft.graph, registry_snapshot=registry)
+            plan = compiler.compile(
+                workflow_revision_id=revision.revision_id, graph=draft.graph,
+                registry_snapshot=registry, compilation_context=compilation_context,
+            )
             session.execute(update(WorkflowRevisionModel).where(WorkflowRevisionModel.workflow_id == workflow_id, WorkflowRevisionModel.revision_status == RevisionStatus.ACTIVE).values(revision_status=RevisionStatus.RETIRED))
             revision_model = WorkflowRevisionModel(revision_id=revision.revision_id, workflow_id=workflow_id, revision_number=revision.revision_number, graph_hash=revision.graph_hash, execution_hash=revision.execution_hash, registry_snapshot_id=registry.snapshot_id, graph=draft.graph, config=draft.config, layout=draft.layout, revision_status=RevisionStatus.ACTIVE, created_at=revision.created_at)
             session.add(revision_model)

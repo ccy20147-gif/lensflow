@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -33,6 +34,61 @@ class CompilationError(SafeError):
             correlation_id=correlation_id,
             details={"diagnostics": diagnostics},
         )
+
+
+@dataclass(frozen=True)
+class CompilationContext:
+    """Authoritative inputs collected by the application service.
+
+    The compiler is intentionally unable to read a request, a database, or a
+    provider directly.  Its caller must supply the actor-scoped entitlement
+    decision and the provider policy snapshot that were evaluated for this
+    compilation.  Keeping this object in the immutable plan makes a replay
+    explainable instead of consulting ``latest`` policy at execution time.
+    """
+
+    actor_scope: str
+    entitlement_decision: dict[str, Any] = field(default_factory=dict)
+    provider_selection_policy_ref: str = "atlascloud.default.v1"
+    policy_revision: str = "toonflow.policy.v1"
+    capability_snapshot_ref: str = "atlascloud.capabilities.v1"
+    available_capabilities: tuple[str, ...] = ()
+    # ``False`` means the executor was removed or is intentionally disabled.
+    # Omitted entries are supported by the current runtime and retain legacy
+    # compatibility for platform-owned built-ins.
+    executor_availability: dict[str, bool] = field(default_factory=dict)
+
+
+def _enrich_diagnostic(diagnostic: dict[str, Any]) -> dict[str, Any]:
+    """Expose stable UI fields alongside the legacy location string."""
+    result = dict(diagnostic)
+    location = str(result.get("location", "global"))
+    result.setdefault("code", "WF_COMPILE_" + location.upper().replace(":", "_").replace(".", "_").replace("-", "_")[:72])
+    result.setdefault("safe_message", result.get("message", "Compilation validation failed"))
+    result.setdefault("node_instance_id", None)
+    result.setdefault("port_id", None)
+    result.setdefault("config_path", None)
+    if location.startswith("node:"):
+        parts = location.split(":")
+        if len(parts) > 1:
+            result["node_instance_id"] = parts[1]
+        if "port" in parts:
+            index = parts.index("port")
+            if index + 1 < len(parts):
+                result["port_id"] = parts[index + 1]
+        config_part = next((part for part in parts if part == "config" or part.startswith("config.")), None)
+        if config_part is not None:
+            suffix = config_part[7:] if config_part.startswith("config.") else ""
+            result["config_path"] = suffix or "$"
+    elif location.startswith("edge:"):
+        # Keep an edge location for existing clients, while pointing the UI to
+        # the destination port where a correction is normally made.
+        tail = location[5:]
+        if "->" in tail:
+            _source, destination = tail.split("->", 1)
+            if "." in destination:
+                result["node_instance_id"], result["port_id"] = destination.rsplit(".", 1)
+    return result
 
 
 class WorkflowCompiler:
@@ -97,6 +153,7 @@ class WorkflowCompiler:
         registry_snapshot: RegistrySnapshot,
         resolved_input_refs: list[ResourceRef | ArtifactRef] | None = None,
         budget_limits: dict[str, Any] | None = None,
+        compilation_context: CompilationContext | None = None,
     ) -> CompiledExecutionPlan:
         """Compile a workflow graph into a plan.
 
@@ -108,7 +165,9 @@ class WorkflowCompiler:
         nodes: list[dict] = graph.get("nodes", [])
         edges: list[dict] = graph.get("edges", [])
         try:
-            nodes, edges = self._materialize_managed_agent_task_plans(nodes, edges)
+            nodes, edges = self._materialize_managed_agent_task_plans(
+                nodes, edges, workflow_revision_id=workflow_revision_id, registry_snapshot=registry_snapshot,
+            )
         except ValueError as exc:
             diagnostics.append({"severity": "error", "location": "managed_agent", "message": str(exc)})
 
@@ -120,7 +179,15 @@ class WorkflowCompiler:
                 "message": "工作流图不包含任何节点",
             })
 
-        budget_limits = budget_limits or {}
+        # ``budget_limits`` is retained as a bounded execution limit.  Policy
+        # and entitlement must come from the service-created context, never a
+        # browser supplied budget object.  The optional fallback preserves the
+        # pure unit compiler API; all HTTP publication/compile paths provide a
+        # context and are the security boundary.
+        budget_limits = dict(budget_limits or {})
+        context = compilation_context
+        if context is not None:
+            budget_limits["available_capabilities"] = list(context.available_capabilities)
         # 2. Validate node references, frozen config and policy metadata.
         node_ids = set()
         for node in nodes:
@@ -154,6 +221,12 @@ class WorkflowCompiler:
                 })
             diagnostics.extend(self._validate_config(node, defn))
             diagnostics.extend(self._validate_control_node(node, workflow_revision_id))
+            if context is not None:
+                declared_owner = str((defn.policy_metadata or {}).get("owner_scope", ""))
+                if declared_owner and declared_owner != context.actor_scope:
+                    diagnostics.append({"severity": "error", "location": f"node:{node_id}", "code": "WF_ENTITLEMENT_OWNER_SCOPE", "message": "节点不属于当前 owner_scope", "remediation": "Use a revision owned by the authenticated project owner."})
+                if context.entitlement_decision.get("allowed") is False:
+                    diagnostics.append({"severity": "error", "location": f"node:{node_id}", "code": "WF_ENTITLEMENT_DENIED", "message": "当前 entitlement 决策拒绝执行", "remediation": "Resolve the entitlement or material-rights gate and compile again."})
 
         # 3. Validate edge connections
         for edge in edges:
@@ -198,6 +271,7 @@ class WorkflowCompiler:
                 })
 
         # 6. Raise if errors found
+        diagnostics = [_enrich_diagnostic(diagnostic) for diagnostic in diagnostics]
         errors = [d for d in diagnostics if d["severity"] == "error"]
         if errors:
             raise CompilationError(
@@ -216,13 +290,29 @@ class WorkflowCompiler:
             str(definition.policy_metadata.get("policy_revision", "platform.default.v1"))
             for definition in registry_snapshot.node_definitions.values()
         })
+        if context is not None:
+            policy_revisions = sorted({*policy_revisions, context.policy_revision})
         capability_snapshots = sorted({
             str(capability)
             for definition in registry_snapshot.node_definitions.values()
             for capability in definition.policy_metadata.get("provider_capabilities", [])
             if isinstance(capability, str)
         })
-        provider_policy_ref = str(budget_limits.get("provider_selection_policy_ref", "atlascloud.default.v1"))
+        if context is not None:
+            capability_snapshots = sorted({*capability_snapshots, context.capability_snapshot_ref, *context.available_capabilities})
+        provider_policy_ref = context.provider_selection_policy_ref if context is not None else str(budget_limits.get("provider_selection_policy_ref", "atlascloud.default.v1"))
+        if context is not None:
+            for node_id, executor_ref in executor_refs.items():
+                if context.executor_availability.get(executor_ref) is False:
+                    raise CompilationError(
+                        "编译失败：旧执行器不可重放",
+                        [_enrich_diagnostic({
+                            "severity": "error", "location": f"node:{node_id}",
+                            "code": "WF_EXECUTOR_REPLAY_UNAVAILABLE",
+                            "message": f"固定 executor '{executor_ref}' 已不可用，不能静默替换为 latest",
+                            "remediation": "Create a new WorkflowRevision through the documented executor migration, then recompile; historical plan remains read-only.",
+                        })],
+                    )
         plan_hash_input = json.dumps({
             "workflow_revision_id": str(workflow_revision_id),
             "nodes": sorted(
@@ -236,6 +326,8 @@ class WorkflowCompiler:
             "provider_policy_ref": provider_policy_ref,
             "capability_snapshots": capability_snapshots,
             "policy_revisions": policy_revisions,
+            "actor_scope": context.actor_scope if context is not None else "",
+            "entitlement_snapshot": context.entitlement_decision if context is not None else {},
             "resolved_input_refs": [ref.model_dump(mode="json") for ref in (resolved_input_refs or [])],
             "budget_limits": budget_limits,
         }, sort_keys=True)
@@ -253,6 +345,8 @@ class WorkflowCompiler:
             provider_policy_ref=provider_policy_ref,
             capability_snapshots=capability_snapshots,
             policy_revisions=policy_revisions,
+            actor_scope=context.actor_scope if context is not None else "",
+            entitlement_snapshot=dict(context.entitlement_decision) if context is not None else {},
             budget_limits=budget_limits,
             compiler_version=self.compiler_version,
             plan_hash=plan_hash,
@@ -339,6 +433,7 @@ class WorkflowCompiler:
         *,
         graph: dict[str, Any],
         registry_snapshot: RegistrySnapshot,
+        compilation_context: CompilationContext | None = None,
     ) -> tuple[bool, list[dict]]:
         """Dry-run compilation returning (passes, diagnostics).
 
@@ -349,6 +444,7 @@ class WorkflowCompiler:
                 workflow_revision_id=uuid.uuid4(),
                 graph=graph,
                 registry_snapshot=registry_snapshot,
+                compilation_context=compilation_context,
             )
             return True, []
         except CompilationError as e:
@@ -377,6 +473,8 @@ class WorkflowCompiler:
             "provider_policy_ref": plan.provider_policy_ref,
             "capability_snapshots": plan.capability_snapshots,
             "policy_revisions": plan.policy_revisions,
+            "actor_scope": plan.actor_scope,
+            "entitlement_snapshot": plan.entitlement_snapshot,
             "resolved_input_refs": [ref.model_dump(mode="json") for ref in plan.resolved_input_refs],
             "budget_limits": plan.budget_limits,
         }, sort_keys=True)
@@ -414,7 +512,8 @@ class WorkflowCompiler:
 
     @staticmethod
     def _materialize_managed_agent_task_plans(
-        nodes: list[dict], edges: list[dict],
+        nodes: list[dict], edges: list[dict], *, workflow_revision_id: uuid.UUID,
+        registry_snapshot: RegistrySnapshot,
     ) -> tuple[list[dict], list[dict]]:
         """Expand a managed Agent presentation card into workflow-owned tasks.
 
@@ -429,6 +528,12 @@ class WorkflowCompiler:
         for node in nodes:
             data = node.get("data", {}) if isinstance(node, dict) else {}
             task_plan = data.get("managed_task_plan") if isinstance(data, dict) else None
+            definition = registry_snapshot.node_definitions.get(str(node.get("type", ""))) if isinstance(node, dict) else None
+            registered_plan = list(definition.managed_agent_task_plan or []) if definition is not None else []
+            if task_plan is None and registered_plan:
+                task_plan = registered_plan
+            elif task_plan is not None and registered_plan and task_plan != registered_plan:
+                raise ValueError("managed Agent task plan must match the registered Workflow node template")
             if task_plan is None:
                 expanded_nodes.append(node)
                 continue
@@ -439,12 +544,19 @@ class WorkflowCompiler:
             for index, task in enumerate(task_plan):
                 if not isinstance(task, dict) or task.get("kind") not in allowed:
                     raise ValueError(f"managed Agent task {node_id}[{index}] has an unsupported kind")
+                if task.get("owner_layer") not in {None, "workflow"}:
+                    raise ValueError(f"managed Agent task {node_id}[{index}] cannot choose a non-workflow owner")
                 kind = str(task["kind"])
                 if kind == "agent_invoke" and not task.get("agent_revision_id"):
                     raise ValueError(f"managed Agent task {node_id}[{index}] requires pinned agent_revision_id")
                 generated.append({
                     "id": f"{node_id}:task:{index}", "type": kind,
-                    "data": {"owner_layer": "workflow", "managed_card_id": node_id, **task},
+                    # Never spread task after ownership fields. This data is
+                    # the compiler-owned expansion contract, not Agent SOP
+                    # metadata, and therefore remains traceable to the fixed
+                    # WorkflowRevision that compiled it.
+                    "data": {**task, "owner_layer": "workflow", "managed_card_id": node_id,
+                             "managed_task_plan_owner_workflow_revision_id": str(workflow_revision_id)},
                 })
             replacement[node_id] = (generated[0]["id"], generated[-1]["id"])
             expanded_nodes.extend(generated)

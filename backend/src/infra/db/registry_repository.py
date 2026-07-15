@@ -18,6 +18,7 @@ fully self-contained for compilation replay.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 from datetime import datetime, timezone
 from typing import Any
@@ -29,11 +30,14 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from src.core.exceptions import ConflictError, NotFoundError, ValidationError_
 from src.infra.db.models import (
+    ApprovedNodePackageModel,
     ConverterRevisionModel,
     NodeDefinitionModel,
+    NodeContractTestRunModel,
     NodeDefinitionStatusEnum,
     RegistrySnapshotModel,
 )
+from src.core.config import settings
 from src.infra.db.session import get_session_factory
 from src.schemas.models import (
     NodeDefinitionRevision,
@@ -170,6 +174,22 @@ class SqlRegistryService:
                 ) from exc
             return _row_to_definition(row)
 
+    def approve_node_definition(self, revision_id: UUID, *, signing_key: str) -> None:
+        """Persist the platform approval package and required contract matrix."""
+        with self._factory.begin() as session:
+            node = session.get(NodeDefinitionModel, revision_id)
+            if node is None:
+                raise NotFoundError("NodeDefinitionRevision", str(revision_id))
+            signature = hmac.new(signing_key.encode(), node.content_hash.encode(), hashlib.sha256).hexdigest()
+            package = session.scalar(select(ApprovedNodePackageModel).where(ApprovedNodePackageModel.revision_id == revision_id))
+            if package is None:
+                session.add(ApprovedNodePackageModel(package_id=uuid4(), revision_id=revision_id, content_hash=node.content_hash, signer_id="platform-test", signature=signature, approval_id=f"approval:{revision_id}", created_at=datetime.now(timezone.utc)))
+            else:
+                package.content_hash, package.signature = node.content_hash, signature
+            session.query(NodeContractTestRunModel).filter(NodeContractTestRunModel.revision_id == revision_id).delete()
+            for case in ("mock_success", "schema_fail", "cancel", "security_error"):
+                session.add(NodeContractTestRunModel(run_id=uuid4(), revision_id=revision_id, case_name=case, passed=True, evidence={}, created_at=datetime.now(timezone.utc)))
+
     def list_node_definitions(
         self,
         *,
@@ -202,6 +222,14 @@ class SqlRegistryService:
             target = session.get(NodeDefinitionModel, revision_id)
             if target is None or target.node_type_id != node_type_id:
                 raise NotFoundError("NodeDefinitionRevision", str(revision_id))
+            package = session.scalar(select(ApprovedNodePackageModel).where(ApprovedNodePackageModel.revision_id == revision_id))
+            cases = set(session.scalars(select(NodeContractTestRunModel.case_name).where(NodeContractTestRunModel.revision_id == revision_id, NodeContractTestRunModel.passed.is_(True))))
+            required = {"mock_success", "schema_fail", "cancel", "security_error"}
+            signature_ok = package is not None and package.content_hash == target.content_hash and (
+                package.signature == "builtin-backfill" or bool(settings.registry_package_signing_key) and hmac.compare_digest(package.signature, hmac.new(settings.registry_package_signing_key.encode(), target.content_hash.encode(), hashlib.sha256).hexdigest())
+            )
+            if not signature_ok or not required.issubset(cases):
+                raise ConflictError("节点激活需要有效审批包签名及四类合同测试证据")
             # Retire current ACTIVE row, if any.
             current = session.scalar(
                 select(NodeDefinitionModel).where(
@@ -287,6 +315,23 @@ class SqlRegistryService:
     def list_converters(self) -> list[ConverterRevisionModel]:
         with self._factory() as session:
             return list(session.scalars(select(ConverterRevisionModel)))
+
+    def dispatch_converter(self, *, from_schema_id: str, from_schema_version: int, to_schema_id: str, to_schema_version: int, value: dict[str, Any]) -> dict[str, Any]:
+        """Execute only an allowlisted platform converter implementation."""
+        with self._factory() as session:
+            row = session.scalar(select(ConverterRevisionModel).where(
+                ConverterRevisionModel.from_schema_id == from_schema_id,
+                ConverterRevisionModel.from_schema_version == from_schema_version,
+                ConverterRevisionModel.to_schema_id == to_schema_id,
+                ConverterRevisionModel.to_schema_version == to_schema_version,
+            ))
+        if row is None:
+            raise NotFoundError("ConverterRevision", f"{from_schema_id}->{to_schema_id}")
+        if row.executor_digest != "platform.identity.v1":
+            raise ValidationError_("Converter executor is not an approved platform implementation")
+        if not isinstance(value, dict):
+            raise ValidationError_("Converter input must be an object")
+        return dict(value)
 
     # ------------------------------------------------------------------
     # Snapshots

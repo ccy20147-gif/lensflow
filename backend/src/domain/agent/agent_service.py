@@ -17,8 +17,14 @@ _FORBIDDEN_KEYS = {
     "media_recipe", "human_gate", "workbench_task", "resource_commit",
     "resource_revision", "resource_draft", "code", "script", "shell",
     "url", "http", "network", "credential", "credential_binding",
+    # Managed task plans belong exclusively to registered Workflow nodes.
+    "managed_task_plan", "managed_agent_task_plan", "task_plan",
 }
 _SECRET = re.compile(r"(?:sk-[A-Za-z0-9]{12,}|api[_-]?key\s*[:=]|bearer\s+[A-Za-z0-9._-]+)", re.I)
+_SCHEMA_REF = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*(?:\.v|@)[1-9][0-9]*$")
+_EXECUTION_BOUNDARY = "runtime_and_approved_tool_broker_only"
+_FAILURE_STRATEGIES = {"fail", "retry", "request_input"}
+_CHECKPOINT_MODES = {"none", "after_step"}
 
 
 def _reject(message: str, field: str) -> None:
@@ -50,8 +56,58 @@ def _schema_ref(value: Any, field: str, *, required: bool) -> None:
         if required:
             _reject("Agent requires a typed schema reference", field)
         return
-    if not isinstance(value, str) or len(value) > 255 or value.strip() != value:
-        _reject("Invalid schema reference", field)
+    if not isinstance(value, str) or len(value) > 255 or value.strip() != value or not _SCHEMA_REF.fullmatch(value):
+        _reject("Schema reference must include a stable identity and positive version", field)
+
+
+def _request_input_policy(value: Any) -> None:
+    """Validate the frozen policy which gates runtime RequestInput creation."""
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        _reject("request_input_policy must be an object", "request_input_policy")
+    allowed = {"enabled", "allowed_schema_refs", "max_requests_per_attempt", "max_timeout_minutes", "max_response_bytes"}
+    unknown = set(value) - allowed
+    if unknown:
+        _reject("request_input_policy contains unsupported fields", "request_input_policy")
+    if "enabled" in value and not isinstance(value["enabled"], bool):
+        _reject("request_input_policy.enabled must be boolean", "request_input_policy.enabled")
+    refs = value.get("allowed_schema_refs", [])
+    if not isinstance(refs, list) or len(set(map(str, refs))) != len(refs):
+        _reject("request_input_policy.allowed_schema_refs must be unique", "request_input_policy.allowed_schema_refs")
+    for index, ref in enumerate(refs):
+        _schema_ref(ref, f"request_input_policy.allowed_schema_refs[{index}]", required=True)
+    for field, maximum in (("max_requests_per_attempt", 16), ("max_timeout_minutes", 10_080), ("max_response_bytes", 1_000_000)):
+        if field in value and (not isinstance(value[field], int) or isinstance(value[field], bool) or not 1 <= value[field] <= maximum):
+            _reject(f"request_input_policy.{field} is outside allowed bounds", f"request_input_policy.{field}")
+
+
+def _bindings(value: Any, field: str) -> None:
+    """Validate declarative SOP data mappings, never executable expressions."""
+    if not isinstance(value, dict):
+        _reject(f"{field} must be an object", field)
+    for key, reference in value.items():
+        if not isinstance(key, str) or not key or not isinstance(reference, str) or not reference:
+            _reject(f"{field} must map non-empty names to non-empty references", field)
+        if len(key) > 128 or len(reference) > 512:
+            _reject(f"{field} entry exceeds size limit", field)
+
+
+def _step_execution_policies(step: dict[str, Any], path: str) -> None:
+    _bindings(step.get("input_bindings", {}), f"{path}.input_bindings")
+    _bindings(step.get("output_bindings", {}), f"{path}.output_bindings")
+    checkpoint = step.get("checkpoint_policy", {})
+    if not isinstance(checkpoint, dict) or set(checkpoint) - {"mode"}:
+        _reject("checkpoint_policy only supports mode", f"{path}.checkpoint_policy")
+    checkpoint_mode = checkpoint.get("mode", "none")
+    if checkpoint_mode not in _CHECKPOINT_MODES:
+        _reject("checkpoint_policy.mode is unsupported", f"{path}.checkpoint_policy.mode")
+    failure = step.get("failure_policy", {})
+    if not isinstance(failure, dict) or set(failure) - {"strategy"}:
+        _reject("failure_policy only supports strategy", f"{path}.failure_policy")
+    strategy = failure.get("strategy", "fail")
+    if strategy not in _FAILURE_STRATEGIES:
+        _reject("failure_policy.strategy is unsupported", f"{path}.failure_policy.strategy")
 
 
 def validate_agent(body: dict[str, Any]) -> None:
@@ -88,6 +144,10 @@ def validate_agent(body: dict[str, Any]) -> None:
         # publication time by AgentInvocationService.
         if not isinstance(output_schema, dict) or "type" not in output_schema:
             _reject("output_schema must be a typed JSON Schema object", "output_schema")
+    boundary = body.get("execution_boundary", _EXECUTION_BOUNDARY)
+    if boundary != _EXECUTION_BOUNDARY:
+        _reject("Agent execution_boundary must be runtime_and_approved_tool_broker_only", "execution_boundary")
+    _request_input_policy(body.get("request_input_policy", {}))
     seen: set[str] = set()
     for index, step in enumerate(steps):
         path = f"sop_steps[{index}]"
@@ -102,6 +162,7 @@ def validate_agent(body: dict[str, Any]) -> None:
         retries = step.get("retry_policy", {})
         if retries and (not isinstance(retries, dict) or int(retries.get("max_attempts", 1)) < 1):
             _reject("retry_policy.max_attempts must be at least one", f"{path}.retry_policy")
+        _step_execution_policies(step, path)
         _schema_ref(step.get("output_schema_ref"), f"{path}.output_schema_ref", required=False)
         _walk(step, path)
     for field in ("skill_revision_refs", "tool_revision_refs"):

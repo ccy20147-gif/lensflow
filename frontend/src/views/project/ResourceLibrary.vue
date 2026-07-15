@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { apiGet, apiPost } from '@/api/client'
+import { apiGet, apiPost, apiPut } from '@/api/client'
 
 interface Artifact { artifact_version_id: string; schema_id: string; schema_version: number; content_hash?: string; content_uri?: string }
 interface Resource { resource_id: string; resource_type: string; revision_count: number; active_revision_id?: string; draft: { draft_version: number; content_artifact_version_id: string } }
@@ -11,6 +11,10 @@ const schemaId = ref('toonflow.world.v1')
 const contentText = ref('{"title":"已确认工作台结果"}')
 const resourceType = ref('world')
 const provenance = ref<any>(null)
+const selected = ref<Resource | null>(null)
+const draftArtifactId = ref('')
+const revisions = ref<any[]>([])
+const revisionDiff = ref<any>(null)
 const error = ref('')
 const busy = ref(false)
 const resourceTypes = ['world', 'character', 'shot_plan', 'shot_spec', 'creative_work', 'agent', 'recipe', 'generic']
@@ -46,6 +50,26 @@ async function promote(artifact: Artifact) {
 async function inspect(resource: Resource) {
   error.value = ''
   try { provenance.value = await apiGet(`/artifacts/resources/${resource.resource_id}/provenance`) }
+  catch (cause) { error.value = cause instanceof Error ? cause.message : String(cause) }
+}
+
+async function editDraft(resource: Resource) {
+  selected.value = resource; draftArtifactId.value = resource.draft.content_artifact_version_id; revisionDiff.value = null
+  try { revisions.value = await apiGet<any[]>(`/artifacts/resources/${resource.resource_id}/revisions`) }
+  catch (cause) { error.value = cause instanceof Error ? cause.message : String(cause) }
+}
+
+async function saveDraft() {
+  if (!selected.value || !draftArtifactId.value) return
+  busy.value = true
+  try { await apiPut(`/artifacts/resources/${selected.value.resource_id}/draft`, { content_artifact_version_id: draftArtifactId.value, base_draft_version: selected.value.draft.draft_version }); await load() }
+  catch (cause) { error.value = cause instanceof Error ? cause.message : String(cause) }
+  finally { busy.value = false }
+}
+
+async function diffRevisions(left: string, right: string) {
+  if (!selected.value) return
+  try { revisionDiff.value = await apiGet(`/artifacts/resources/${selected.value.resource_id}/revisions/${left}/diff/${right}`) }
   catch (cause) { error.value = cause instanceof Error ? cause.message : String(cause) }
 }
 
@@ -95,9 +119,10 @@ onMounted(load)
       <div v-if="resources.length === 0" class="empty">尚未提升资源。</div>
       <article v-for="resource in resources" :key="resource.resource_id" class="resource-card">
         <div><b>{{ resource.resource_type }}</b><code>{{ resource.resource_id }}</code><small>Draft v{{ resource.draft.draft_version }} · {{ resource.revision_count }} 个冻结版本</small></div>
-        <div class="resource-actions"><button @click="inspect(resource)">查看 lineage</button><button :disabled="busy" @click="freeze(resource)">冻结 Draft</button></div>
+        <div class="resource-actions"><button @click="inspect(resource)">查看 lineage</button><button @click="editDraft(resource)">编辑 Draft</button><button :disabled="busy" @click="freeze(resource)">冻结 Draft</button></div>
       </article>
     </section>
+    <section v-if="selected" class="provenance" aria-label="Resource Draft 编辑器"><h2>Draft v{{ selected.draft.draft_version }}</h2><select v-model="draftArtifactId" aria-label="Draft ArtifactVersion"><option v-for="artifact in artifacts" :key="artifact.artifact_version_id" :value="artifact.artifact_version_id">{{ artifact.schema_id }} · {{ artifact.artifact_version_id.slice(0, 8) }}</option></select><button :disabled="busy" @click="saveDraft">保存 Draft (CAS)</button><div v-if="revisions.length > 1"><button v-for="revision in revisions.slice(1)" :key="revision.revision_id" @click="diffRevisions(revisions[0].revision_id, revision.revision_id)">比较 Revision</button></div><pre v-if="revisionDiff" aria-label="Resource Revision 差异">{{ JSON.stringify(revisionDiff, null, 2) }}</pre></section>
     <section v-if="provenance" class="provenance" aria-live="polite"><h2>{{ provenance.rebuilt ? 'Canonical 重建结果' : '固定版本 lineage' }}</h2><pre>{{ JSON.stringify(provenance, null, 2) }}</pre></section>
   </div>
 </template>

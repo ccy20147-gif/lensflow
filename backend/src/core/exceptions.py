@@ -26,13 +26,16 @@ class SafeError(Exception):
         super().__init__(self.message)
 
     def to_dict(self) -> dict:
-        return {
-            "error": {
-                "code": self.code,
-                "message": self.message,
-                "correlation_id": self.correlation_id,
-            }
+        error = {
+            "code": self.code,
+            "message": self.message,
+            "correlation_id": self.correlation_id,
         }
+        # Conflict recovery needs the server's current immutable facts.  Keep
+        # this opt-in: ordinary errors retain their existing public shape.
+        if self.details:
+            error["details"] = self.details
+        return {"error": error}
 
 
 class NotFoundError(SafeError):

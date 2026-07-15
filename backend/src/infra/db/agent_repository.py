@@ -30,6 +30,7 @@ from src.infra.db.models import (
     ToolRevisionModel,
     WorkflowRevisionModel,
     NodeRunAttemptModel,
+    OutboxEventModel,
 )
 from src.infra.db.session import get_session_factory
 from src.schemas.enums import RevisionStatus
@@ -161,29 +162,129 @@ class SqlAgentRepository:
             return draft
 
     def submit_draft(self, agent_id: UUID, *, base_draft_version: int) -> AgentRevision:
-        """Submit the already-saved draft body; callers cannot replace it."""
+        """Freeze the current draft in one transaction.
+
+        The draft lock is deliberately held while validation and every
+        immutable write complete.  In particular, never reserve a draft
+        version in one transaction and create a revision in another: a failed
+        revision write must leave no observable authoring-state change.
+        """
+        from src.domain.agent.agent_service import validate_agent
         with self._factory.begin() as session:
+            definition = session.get(AgentDefinitionModel, agent_id)
             draft = session.get(AgentDraftModel, agent_id, with_for_update=True)
-            if draft is None:
+            if definition is None or draft is None:
                 raise NotFoundError("AgentDraft", str(agent_id))
             if draft.draft_version != base_draft_version:
-                raise ConflictError("AgentDraft compare-and-swap conflict")
+                raise ConflictError(
+                    "AgentDraft compare-and-swap conflict",
+                    details=self._draft_conflict_details(draft),
+                )
             body = dict(draft.body or {})
-            # Reserve this authoring version before opening the independent
-            # immutable-revision transaction below. A concurrent submit/save
-            # necessarily observes a different draft_version.
+            validate_agent(body)
+            revision = self._write_revision_in_session(
+                session, definition=definition, draft=draft, body=body,
+            )
+            # A successful submit consumes exactly the submitted authoring
+            # version. All attached resource/artifact/revision rows are
+            # flushed before the surrounding context commits.
             draft.draft_version += 1
             draft.updated_at = datetime.now(timezone.utc)
-        try:
-            return self.create_revision(agent_id, body)
-        except Exception:
-            # Release an unused reservation only if no later author changed
-            # the draft. This preserves CAS semantics on a failed validation.
-            with self._factory.begin() as session:
-                draft = session.get(AgentDraftModel, agent_id, with_for_update=True)
-                if draft is not None and draft.draft_version == base_draft_version + 1:
-                    draft.draft_version = base_draft_version
-            raise
+            session.flush()
+            return _revision_row_to_schema(revision, agent_kind=definition.agent_kind)
+
+    @staticmethod
+    def _draft_conflict_details(draft: AgentDraftModel) -> dict:
+        return {
+            "current_draft_version": draft.draft_version,
+            "current_content_hash": draft.content_hash,
+            "base_revision_id": str(draft.base_revision_id) if draft.base_revision_id else None,
+        }
+
+    def _write_revision_in_session(
+        self,
+        session: Session,
+        *,
+        definition: AgentDefinitionModel,
+        draft: AgentDraftModel,
+        body: dict,
+        base_hash: str | None = None,
+    ) -> AgentRevisionModel:
+        """Write an Agent revision and canonical resource projection.
+
+        The caller owns the transaction and, for authoring submit, the locked
+        AgentDraft row. This small seam is intentionally testable so a forced
+        failure proves that no partial reservation or immutable row commits.
+        """
+        content_hash = _compute_hash(body)
+        latest = session.scalar(
+            select(AgentRevisionModel)
+            .where(AgentRevisionModel.agent_id == definition.agent_id)
+            .order_by(AgentRevisionModel.revision_number.desc())
+            .limit(1)
+        )
+        next_number = (latest.revision_number + 1) if latest else 1
+        if definition.agent_kind == "managed_preset" and latest is not None:
+            raise ForbiddenError("Managed preset Agent revisions are platform-locked")
+        self._validate_dependencies(session, definition, body)
+        if base_hash is not None:
+            if latest is None:
+                raise ConflictError(message="No existing revision to base on for CAS check")
+            if latest.content_hash != base_hash:
+                raise ConflictError(message="CAS conflict: base_hash does not match latest revision content_hash")
+
+        row = AgentRevisionModel(
+            revision_id=uuid4(), agent_id=definition.agent_id,
+            revision_number=next_number, body=dict(body), content_hash=content_hash,
+            base_hash=base_hash, status="draft", created_at=datetime.now(timezone.utc),
+        )
+        session.add(row)
+        session.flush()
+        artifact = ArtifactVersionModel(
+            artifact_version_id=uuid4(), artifact_id=definition.agent_id,
+            schema_id="toonflow.agent_revision", schema_version=1,
+            owner_scope=definition.owner_scope, content_json=dict(body),
+            content_hash=content_hash,
+            metadata_json={"agent_revision_id": str(row.revision_id)},
+            created_at=datetime.now(timezone.utc),
+        )
+        session.add(artifact)
+        resource = session.get(ResourceModel, definition.agent_id)
+        if resource is None:
+            resource = ResourceModel(resource_id=definition.agent_id, resource_type="agent",
+                                     owner_scope=definition.owner_scope, created_at=datetime.now(timezone.utc))
+            session.add(resource)
+            session.flush()
+        resource_draft = session.get(ResourceDraftModel, definition.agent_id)
+        if resource_draft is None:
+            session.add(ResourceDraftModel(
+                resource_id=definition.agent_id, draft_version=1, base_revision_id=row.revision_id,
+                content_artifact_version_id=artifact.artifact_version_id, updated_at=datetime.now(timezone.utc),
+            ))
+        else:
+            resource_draft.draft_version += 1
+            resource_draft.base_revision_id = row.revision_id
+            resource_draft.content_artifact_version_id = artifact.artifact_version_id
+            resource_draft.updated_at = datetime.now(timezone.utc)
+        session.add(ResourceRevisionModel(
+            revision_id=row.revision_id, resource_id=definition.agent_id, revision_number=next_number,
+            content_artifact_version_id=artifact.artifact_version_id,
+            revision_status=RevisionStatus.DRAFT, created_at=datetime.now(timezone.utc),
+        ))
+        # Reverse-index materialisation is intentionally asynchronous. The
+        # immutable revision remains the source of truth and the durable
+        # outbox can retry a failed index worker without half-publishing it.
+        session.add(OutboxEventModel(
+            event_id=uuid4(), aggregate_type="agent_revision", aggregate_id=row.revision_id,
+            event_type="agent_revision.index_requested", purpose="agent_revision_index",
+            payload={"agent_id": str(definition.agent_id), "revision_id": str(row.revision_id),
+                     "owner_scope": definition.owner_scope}, created_at=datetime.now(timezone.utc),
+        ))
+        draft.body = dict(body)
+        draft.content_hash = content_hash
+        draft.base_revision_id = row.revision_id
+        session.flush()
+        return row
 
     def dry_run_draft(self, agent_id: UUID, *, draft_version: int, budget: dict,
                       fixed_input: dict | None = None, simulated_output: dict | None = None,
@@ -226,6 +327,155 @@ class SqlAgentRepository:
             session.flush()
             return {"valid": not failure_owner, "plan_hash": plan["plan_hash"], "trial_id": str(trial.trial_id), "budget": dict(budget), "status": trial.status, "failure_owner": failure_owner}
 
+    def run_isolated_runtime_trial(self, agent_id: UUID, *, draft_version: int, budget: dict,
+                                   fixed_input: dict | None = None) -> dict:
+        """Execute a draft through the same durable worker/invocation boundary.
+
+        A trial receives a transient, owner-scoped frozen revision and an
+        isolated WorkflowRun. The fake Atlas transport is server-owned and
+        deterministic; browser callers can influence only typed input/budget.
+        """
+        import httpx
+        from src.domain.agent.invocation_service import AgentInvocationService
+        from src.domain.provider.atlascloud import AtlasCloudAdapter
+        from src.domain.runtime.runtime_service import RuntimeService
+        from src.domain.runtime.worker import RuntimeWorker
+        from src.infra.db.models import (CredentialBindingModel, ToolInvocationModel,
+                                         WorkflowModel, WorkflowRevisionModel,
+                                         NodeRunAttemptModel, NodeRunModel)
+        from src.schemas.enums import RevisionStatus
+        from src.schemas.models import CompiledExecutionPlan, OwnerScope, RegistrySnapshot
+
+        source = self.get_definition(agent_id)
+        draft = self.get_draft(agent_id)
+        if draft.draft_version != draft_version:
+            raise ConflictError("AgentDraft compare-and-swap conflict", details=self._draft_conflict_details(draft))
+        from src.domain.agent.agent_service import validate_agent
+        body = dict(draft.body or {})
+        validate_agent(body)
+        # Test provider output is server-controlled and deliberately generic;
+        # a typed output schema still decides whether this trial succeeds.
+        tool_call: dict | None = None
+        if body.get("tool_revision_refs"):
+            first_tool_revision = UUID(str(body["tool_revision_refs"][0]))
+            with self._factory() as session:
+                tool_revision = session.get(ToolRevisionModel, first_tool_revision)
+                operation = next((item for item in (tool_revision.body or {}).get("operations", []) if isinstance(item, dict)), None) if tool_revision else None
+            if operation is not None:
+                tool_call = {"tool_revision_id": str(first_tool_revision), "operation_id": str(operation.get("id", "")),
+                             "requested_scopes": [], "disclosure_fields": list(operation.get("disclosure_fields", [])), "input": {}}
+        class _TrialAtlas:
+            def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+                output = {"tool_calls": [tool_call]} if tool_call is not None else {"text": "trial"}
+                return httpx.Response(200, request=httpx.Request(method, url), json={"data": [output], "model_version": "atlascloud-trial"})
+
+        trial_def = self.create_definition(name=f"trial:{source.name}", description="isolated studio trial", agent_kind="configurable", owner_scope=source.owner_scope)
+        trial_rev = self.create_revision(trial_def.agent_id, body)
+        self.promote_revision(trial_rev.revision_id)
+        owner_kind, owner_id = source.owner_scope.split(":", 1)
+        owner = OwnerScope(kind=owner_kind, id=UUID(owner_id))
+        workflow_id, workflow_revision_id = uuid4(), uuid4()
+        graph = {"nodes": [{"id": "trial-agent", "type": "agent_invoke"}], "edges": []}
+        with self._factory.begin() as session:
+            session.add(WorkflowModel(workflow_id=workflow_id, owner_scope=source.owner_scope))
+            session.add(WorkflowRevisionModel(revision_id=workflow_revision_id, workflow_id=workflow_id, revision_number=1,
+                graph_hash="trial", execution_hash="trial", registry_snapshot_id=uuid4(), graph=graph, config={}, layout={}, revision_status=RevisionStatus.ACTIVE, created_at=datetime.now(timezone.utc)))
+        runtime = RuntimeService(self._factory)
+        plan = CompiledExecutionPlan(plan_id=uuid4(), workflow_revision_id=workflow_revision_id,
+            registry_snapshot=RegistrySnapshot(snapshot_id=uuid4()), resolved_graph=graph, budget_limits=dict(budget), plan_hash="studio-trial")
+        run = runtime.create_run(compiled_plan=plan, owner_scope=owner, input_snapshot=dict(fixed_input or {}))
+        runtime.start_run(run.run_id)
+        with self._factory.begin() as session:
+            node = session.query(NodeRunModel).filter(NodeRunModel.run_id == run.run_id).one()
+            attempt = session.query(NodeRunAttemptModel).filter(NodeRunAttemptModel.node_run_id == node.node_run_id).one()
+            runtime_input = {**dict(fixed_input or {}), "agent_revision_id": str(trial_rev.revision_id)}
+            # Credentials never cross the HTTP boundary.  For an isolated
+            # Studio trial we may select the owner's already-bound frozen Tool
+            # revision, then pass only its opaque binding ID to the broker.
+            # The broker still decrypts and authorizes it server-side.
+            bindings: dict[str, str] = {}
+            for tool_revision_id in trial_rev.tool_revision_refs:
+                bound = session.scalar(select(CredentialBindingModel).where(
+                    CredentialBindingModel.owner_scope == source.owner_scope,
+                    CredentialBindingModel.tool_revision_id == tool_revision_id,
+                    CredentialBindingModel.status == "active",
+                ).order_by(CredentialBindingModel.created_at.desc()))
+                if bound is not None:
+                    bindings[str(tool_revision_id)] = str(bound.binding_id)
+            if bindings:
+                runtime_input["tool_bindings"] = bindings
+            attempt.fixed_input = runtime_input
+        leased = runtime.set_attempt_running(attempt.attempt_id, "studio-trial-worker")
+        invocation = AgentInvocationService(self._factory, adapter=AtlasCloudAdapter(transport=_TrialAtlas(), api_key="studio-trial", base_url="https://atlas.invalid"))
+        try:
+            result = RuntimeWorker(self._factory, agent_invocations=invocation).execute_attempt(leased.attempt_id)
+            status, failure_owner = str(result["status"]), None
+        except ValidationError_ as exc:
+            status, failure_owner = "failed", (exc.details or {}).get("field", "runtime")
+        # A Studio trial deliberately uses a server-owned mock response for a
+        # Tool dispatch.  It exercises the same credential, entitlement,
+        # disclosure and outbox state machine as production without allowing a
+        # browser dry-run to create an external provider side effect.
+        if status == "waiting_tool":
+            from src.domain.agent.tool_broker import ToolBroker
+            broker = ToolBroker(self._factory)
+            class _TrialToolTransport:
+                def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
+                    return httpx.Response(200, request=httpx.Request(method, url),
+                                          json={"trial": "simulated"},
+                                          headers={"content-type": "application/json"})
+            with self._factory() as session:
+                events = list(session.scalars(select(OutboxEventModel.event_id).join(
+                    ToolInvocationModel, OutboxEventModel.aggregate_id == ToolInvocationModel.invocation_id,
+                ).join(
+                    NodeRunAttemptModel, ToolInvocationModel.node_run_attempt_id == NodeRunAttemptModel.attempt_id,
+                ).join(
+                    NodeRunModel, NodeRunAttemptModel.node_run_id == NodeRunModel.node_run_id,
+                ).where(
+                    NodeRunModel.run_id == run.run_id,
+                    OutboxEventModel.aggregate_type == "tool_invocation",
+                    OutboxEventModel.purpose == "tool_dispatch",
+                    OutboxEventModel.published_at.is_(None),
+                )))
+            for event_id in events:
+                dispatch_status = broker.consume_dispatch_event(event_id, transport=_TrialToolTransport())
+                if dispatch_status != "completed":
+                    status, failure_owner = "failed", "tool_dispatch"
+                    break
+            else:
+                status = "completed"
+        with self._factory() as session:
+            traces = list(session.scalars(select(ArtifactVersionModel).where(
+                ArtifactVersionModel.schema_id == "toonflow.agent_sop_trace",
+                ArtifactVersionModel.created_by_run_id == run.run_id,
+            ).order_by(ArtifactVersionModel.created_at)))
+        trial = self.dry_run_draft(agent_id, draft_version=draft_version, budget=budget, fixed_input=fixed_input)
+        # Trace bodies are produced by AgentInvocationService and intentionally
+        # contain hashes/IDs/disclosure IDs only, never prompt or credentials.
+        timeline = [{"phase": row.content_json.get("phase"), "failure_owner": row.content_json.get("failure_owner"),
+                     "tool_disclosures": row.content_json.get("tool_disclosures", []), "artifact_version_id": str(row.artifact_version_id)}
+                    for row in traces]
+        with self._factory() as session:
+            tool_rows = list(session.scalars(select(ToolInvocationModel).join(NodeRunAttemptModel).join(NodeRunModel).where(
+                NodeRunModel.run_id == run.run_id,
+            )))
+        timeline.extend({"phase": "tool_dispatch", "status": row.status,
+                         "tool_disclosures": [{"tool_revision_id": str(row.tool_revision_id),
+                                                "operation_id": row.operation_id,
+                                                "fields": list(row.disclosure_manifest or [])}],
+                         "tool_invocation_id": str(row.invocation_id)} for row in tool_rows)
+        with self._factory.begin() as session:
+            trial_row = session.get(AgentTrialRunModel, UUID(str(trial["trial_id"])), with_for_update=True)
+            if trial_row is not None:
+                trial_row.status, trial_row.failure_owner = status, failure_owner
+                trial_row.runtime_run_id = run.run_id
+                trial_row.runtime_node_run_id = leased.node_run_id
+                trial_row.runtime_attempt_id = leased.attempt_id
+                trial_row.runtime_agent_revision_id = trial_rev.revision_id
+        trial.update({"status": status, "failure_owner": failure_owner, "runtime_run_id": str(run.run_id),
+                      "runtime_trial_agent_revision_id": str(trial_rev.revision_id), "runtime_timeline": timeline})
+        return trial
+
     def clone_definition(self, agent_id: UUID, *, owner_scope: str, name: str) -> AgentDefinitionModel:
         """Clone immutable authoring content, never credential bindings."""
         source = self.get_definition(agent_id)
@@ -241,6 +491,10 @@ class SqlAgentRepository:
             body["clone_lineage"] = {"source_agent_id": str(agent_id), "source_revision_id": str(active.revision_id)}
             self.save_draft(clone.agent_id, body=body, base_draft_version=1)
         return clone
+
+    def clone_rebind_requirements(self, agent_id: UUID) -> list[str]:
+        """Frozen Tool revision IDs for which a clone must bind its own secret."""
+        return sorted({str(value) for value in (self.get_draft(agent_id).body or {}).get("tool_revision_refs", [])})
 
     def create_trial_request_input(self, trial_id: UUID, *, schema_ref: str, question: str, input_schema: dict) -> AgentTrialRequestInputModel:
         with self._factory.begin() as session:
@@ -295,6 +549,8 @@ class SqlAgentRepository:
         self, agent_id: UUID, body: dict, *, base_hash: str | None = None
     ) -> AgentRevision:
         """Create a new draft revision with CAS base_hash check."""
+        from src.domain.agent.agent_service import validate_agent
+        validate_agent(body)
         content_hash = _compute_hash(body)
         # Determine next revision number
         with self._factory.begin() as session:
@@ -303,7 +559,6 @@ class SqlAgentRepository:
             if def_row is None:
                 raise NotFoundError("AgentDefinition", str(agent_id))
             agent_kind = def_row.agent_kind
-            self._validate_dependencies(session, def_row, body)
 
             latest = session.scalar(
                 select(AgentRevisionModel)
@@ -312,6 +567,9 @@ class SqlAgentRepository:
                 .limit(1)
             )
             next_number = (latest.revision_number + 1) if latest else 1
+            if agent_kind == "managed_preset" and latest is not None:
+                raise ForbiddenError("Managed preset Agent revisions are platform-locked")
+            self._validate_dependencies(session, def_row, body)
 
             # If base_hash provided, verify it matches the latest revision
             if base_hash is not None:
@@ -369,6 +627,12 @@ class SqlAgentRepository:
                 revision_id=row.revision_id, resource_id=agent_id, revision_number=next_number,
                 content_artifact_version_id=artifact.artifact_version_id,
                 revision_status=RevisionStatus.DRAFT, created_at=datetime.now(timezone.utc),
+            ))
+            session.add(OutboxEventModel(
+                event_id=uuid4(), aggregate_type="agent_revision", aggregate_id=row.revision_id,
+                event_type="agent_revision.index_requested", purpose="agent_revision_index",
+                payload={"agent_id": str(agent_id), "revision_id": str(row.revision_id),
+                         "owner_scope": def_row.owner_scope}, created_at=datetime.now(timezone.utc),
             ))
             author_draft = session.get(AgentDraftModel, agent_id)
             if author_draft is None:
@@ -437,6 +701,15 @@ class SqlAgentRepository:
             skill = session.get(SkillContentModel, skill_revision.skill_id)
             if skill is None:
                 raise ValidationError_("Agent SkillRevision parent does not exist", details={"field": f"skill_revision_refs[{index}]"})
+            # A damaged/imported Skill row must not become an indirect Agent
+            # invocation path. Normal Skill writes already enforce this; the
+            # submit-time recheck closes the historical-data bypass.
+            from src.domain.skill.skill_service import validate_skill
+            try:
+                validate_skill(dict(skill_revision.body or {}))
+            except ValidationError_ as exc:
+                raise ValidationError_("Agent dependency SkillRevision is not a valid non-executable Skill",
+                                       details={"field": f"skill_revision_refs[{index}]", "cause": exc.details}) from exc
             if skill.owner_scope != definition.owner_scope:
                 if ref is None or ref.resource_id != skill.skill_id or ref.resource_type != "skill":
                     raise ValidationError_(
@@ -485,6 +758,12 @@ class SqlAgentRepository:
                     "Agent ToolRevision must belong to the Agent owner_scope",
                     details={"field": f"tool_revision_refs[{index}]"},
                 )
+            cycle_path = SqlAgentRepository._forbidden_dependency_path(dict(revision.body or {}))
+            if cycle_path is not None:
+                raise ValidationError_(
+                    "ToolRevision cannot depend on Agent, Skill, Workflow, or Recipe revisions",
+                    details={"field": f"tool_revision_refs[{index}].{cycle_path}"},
+                )
         plan_by_revision = {
             str(entry.get("tool_revision_id")): entry
             for entry in body.get("tool_access_plan", [])
@@ -510,6 +789,26 @@ class SqlAgentRepository:
                 allowed_fields = set(registered.get("disclosure_fields", []))
                 if not set(operation.get("disclosure_fields", [])).issubset(allowed_fields):
                     raise ValidationError_("Tool access plan discloses fields not approved by ToolRevision", details={"field": "tool_access_plan"})
+
+    @staticmethod
+    def _forbidden_dependency_path(value: object, path: str = "") -> str | None:
+        """Find a stored Tool dependency that could make Agent references cyclic."""
+        forbidden = {"agent_revision_id", "agent_revision_refs", "skill_revision_id", "skill_revision_refs",
+                     "workflow_revision_id", "workflow_revision_refs", "recipe_revision_id", "recipe_revision_refs"}
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                next_path = f"{path}.{key}" if path else str(key)
+                if str(key) in forbidden:
+                    return next_path
+                found = SqlAgentRepository._forbidden_dependency_path(nested, next_path)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for index, nested in enumerate(value):
+                found = SqlAgentRepository._forbidden_dependency_path(nested, f"{path}[{index}]")
+                if found is not None:
+                    return found
+        return None
 
     def ensure_revision_belongs_to(self, agent_id: UUID, revision_id: UUID) -> None:
         with self._factory() as session:

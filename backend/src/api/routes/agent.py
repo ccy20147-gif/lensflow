@@ -9,7 +9,8 @@ from uuid import UUID
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+from sqlalchemy import select
 
 from src.core.exceptions import ConflictError, ForbiddenError, NotFoundError, PolicyBlockedError, ValidationError_
 from src.infra.db.agent_repository import SqlAgentService
@@ -57,12 +58,10 @@ class SubmitAgentDraftRequest(BaseModel):
 
 
 class DryRunAgentDraftRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     draft_version: int
     budget: dict[str, Any] = {}
     fixed_input: dict[str, Any] = {}
-    simulated_output: dict[str, Any] | None = None
-    usage: dict[str, Any] = {}
-    tool_disclosures: list[dict[str, Any]] = []
 
 
 class CloneAgentRequest(BaseModel):
@@ -187,6 +186,56 @@ async def list_published_agents(authorization: str | None = Header(None)) -> dic
     return await _published_agents(authorization)
 
 
+@router.get("/studio/dependencies")
+async def studio_dependency_catalog(authorization: str | None = Header(None)) -> dict[str, list[dict[str, Any]]]:
+    """Return only owner-accessible immutable dependencies for Agent Studio.
+
+    This endpoint deliberately returns revision IDs, not arbitrary free-text
+    handles. Cross-owner Skills must carry an active grant snapshot; Tools
+    remain same-owner and must have platform approval.
+    """
+    from src.infra.db.models import (
+        ResourceGrantSnapshotModel, SkillContentModel, SkillRevisionModel,
+        ToolDefinitionModel, ToolRevisionModel,
+    )
+    owner_scope = _request_input_owner(authorization)
+    skills: list[dict[str, Any]] = []
+    tools: list[dict[str, Any]] = []
+    with _agent._factory() as session:
+        for revision in session.scalars(select(SkillRevisionModel).where(SkillRevisionModel.status == "active")):
+            skill = session.get(SkillContentModel, revision.skill_id)
+            if skill is None:
+                continue
+            ref: dict[str, Any] | None = None
+            if skill.owner_scope == owner_scope:
+                ref = {"revision_id": str(revision.revision_id)}
+            else:
+                grant = session.scalar(select(ResourceGrantSnapshotModel).where(
+                    ResourceGrantSnapshotModel.resource_revision_id == revision.revision_id,
+                    ResourceGrantSnapshotModel.grantee_scope == owner_scope,
+                    ResourceGrantSnapshotModel.status == "active",
+                ))
+                if grant is not None and {"reference", "execute"}.issubset(set(grant.capability_actions or [])):
+                    ref = {"resource_id": str(skill.skill_id), "resource_type": "skill",
+                           "revision_id": str(revision.revision_id), "grant_snapshot_id": str(grant.grant_snapshot_id)}
+            if ref is not None:
+                skills.append({"name": skill.name, "description": skill.description,
+                               "owner_scope": skill.owner_scope, "ref": ref})
+        for revision in session.scalars(select(ToolRevisionModel).where(
+            ToolRevisionModel.status == "active", ToolRevisionModel.approval_status == "approved",
+        )):
+            tool = session.get(ToolDefinitionModel, revision.tool_id)
+            if tool is None or tool.owner_scope != owner_scope:
+                continue
+            tools.append({"revision_id": str(revision.revision_id), "name": tool.name,
+                          "description": tool.description, "operations": [
+                              {"operation_id": item.get("id"), "disclosure_fields": item.get("disclosure_fields", [])}
+                              for item in (revision.body or {}).get("operations", []) if isinstance(item, dict)
+                          ]})
+    return {"skills": sorted(skills, key=lambda item: (item["name"], str(item["ref"]))),
+            "tools": sorted(tools, key=lambda item: (item["name"], item["revision_id"]))}
+
+
 @router.get("/{agent_id}")
 async def get_agent(agent_id: UUID, authorization: str | None = Header(None)) -> dict:
     """Get an Agent definition by ID."""
@@ -307,9 +356,8 @@ async def dry_run_agent_draft(agent_id: UUID, body: DryRunAgentDraftRequest,
                               authorization: str | None = Header(None)) -> dict:
     try:
         _require_agent_owner(agent_id, authorization)
-        return _agent._repo.dry_run_draft(agent_id, draft_version=body.draft_version, budget=body.budget,
-            fixed_input=body.fixed_input, simulated_output=body.simulated_output,
-            usage=body.usage, tool_disclosures=body.tool_disclosures)
+        return _agent._repo.run_isolated_runtime_trial(agent_id, draft_version=body.draft_version, budget=body.budget,
+            fixed_input=body.fixed_input)
     except (NotFoundError, ConflictError, ForbiddenError, ValidationError_) as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
 
@@ -322,7 +370,8 @@ async def clone_agent(agent_id: UUID, body: CloneAgentRequest,
         _require_agent_owner(agent_id, authorization)
         clone = _agent._repo.clone_definition(agent_id, owner_scope=owner_scope, name=body.name)
         return {"agent_id": str(clone.agent_id), "cloned_from_agent_id": str(agent_id),
-                "credential_bindings": "scrubbed_rebind_required"}
+                "credential_bindings": "scrubbed_rebind_required",
+                "credential_rebind_required_tool_revision_ids": _agent._repo.clone_rebind_requirements(clone.agent_id)}
     except (NotFoundError, ConflictError, ForbiddenError, ValidationError_) as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
 
@@ -339,8 +388,16 @@ async def create_trial_request_input(trial_id: UUID, body: TrialRequestInputRequ
                 raise NotFoundError("AgentTrialRun", str(trial_id))
             if trial.owner_scope != owner:
                 raise ForbiddenError("Agent trial belongs to a different owner")
-        row = _agent._repo.create_trial_request_input(trial_id, **body.model_dump())
-        return {"task_id": str(row.task_id), "status": row.status, "task_version": row.task_version}
+            if not all((trial.runtime_run_id, trial.runtime_node_run_id, trial.runtime_attempt_id, trial.runtime_agent_revision_id)):
+                raise ValidationError_("Agent trial has no durable runtime attempt")
+            values = (trial.runtime_run_id, trial.runtime_node_run_id, trial.runtime_attempt_id, trial.runtime_agent_revision_id)
+        row = _request_input.create(
+            agent_revision_id=values[3], run_id=values[0], node_run_id=values[1], attempt_id=values[2],
+            schema_ref=body.schema_ref, question=body.question, timeout_minutes=60,
+            idempotency_token=f"trial:{trial_id}:request-input", input_schema=body.input_schema,
+            requester_scope=owner,
+        )
+        return {"task_id": str(row.task_id), "status": row.status.value, "task_version": row.task_version}
     except (NotFoundError, ConflictError, ForbiddenError, ValidationError_) as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
 
@@ -348,10 +405,22 @@ async def create_trial_request_input(trial_id: UUID, body: TrialRequestInputRequ
 @router.get("/trials/{trial_id}/request-input")
 async def list_trial_request_inputs(trial_id: UUID, authorization: str | None = Header(None)) -> list[dict]:
     try:
-        rows = _agent._repo.list_trial_request_inputs(trial_id, owner_scope=_request_input_owner(authorization))
-        return [{"task_id": str(row.task_id), "trial_id": str(row.trial_id), "schema_ref": row.schema_ref,
-                 "question": row.question, "input_schema": row.input_schema, "status": row.status,
-                 "task_version": row.task_version, "answer": row.answer} for row in rows]
+        owner = _request_input_owner(authorization)
+        from src.infra.db.models import AgentTrialRunModel, HumanTaskModel
+        with _agent._factory() as session:
+            trial = session.get(AgentTrialRunModel, trial_id)
+            if trial is None or trial.owner_scope != owner:
+                raise NotFoundError("AgentTrialRun", str(trial_id))
+            if trial.runtime_attempt_id is None:
+                return []
+            rows = list(session.query(HumanTaskModel).filter(
+                HumanTaskModel.attempt_id == trial.runtime_attempt_id,
+                HumanTaskModel.task_kind == "request_input", HumanTaskModel.owner_layer == "agent",
+            ).order_by(HumanTaskModel.created_at.desc()))
+        return [{"task_id": str(row.task_id), "trial_id": str(trial_id), "schema_ref": row.schema_ref,
+                 "question": (row.timeout_policy or {}).get("question", ""),
+                 "input_schema": (row.timeout_policy or {}).get("input_schema", {}),
+                 "status": row.status.value, "task_version": row.task_version, "answer": None} for row in rows]
     except (NotFoundError, ForbiddenError) as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
 
@@ -359,10 +428,17 @@ async def list_trial_request_inputs(trial_id: UUID, authorization: str | None = 
 @router.get("/trial-request-input/{task_id}")
 async def get_trial_request_input(task_id: UUID, authorization: str | None = Header(None)) -> dict:
     try:
-        row = _agent._repo.get_trial_request_input(task_id, owner_scope=_request_input_owner(authorization))
-        return {"task_id": str(row.task_id), "trial_id": str(row.trial_id), "schema_ref": row.schema_ref,
-                "question": row.question, "input_schema": row.input_schema, "status": row.status,
-                "task_version": row.task_version, "answer": row.answer}
+        owner = _request_input_owner(authorization)
+        from src.infra.db.models import HumanTaskModel, WorkflowRunModel
+        with _agent._factory() as session:
+            row = session.get(HumanTaskModel, task_id)
+            run = session.get(WorkflowRunModel, row.run_id) if row else None
+            if row is None or run is None or run.owner_scope != owner or row.task_kind != "request_input" or row.owner_layer != "agent":
+                raise NotFoundError("AgentTrialRequestInput", str(task_id))
+        return {"task_id": str(row.task_id), "schema_ref": row.schema_ref,
+                "question": (row.timeout_policy or {}).get("question", ""),
+                "input_schema": (row.timeout_policy or {}).get("input_schema", {}),
+                "status": row.status.value, "task_version": row.task_version, "answer": None}
     except (NotFoundError, ForbiddenError) as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
 
@@ -371,9 +447,10 @@ async def get_trial_request_input(task_id: UUID, authorization: str | None = Hea
 async def resolve_trial_request_input(task_id: UUID, body: ResolveTrialRequestInputRequest,
                                      authorization: str | None = Header(None)) -> dict:
     try:
-        _agent._repo.get_trial_request_input(task_id, owner_scope=_request_input_owner(authorization))
-        row = _agent._repo.resolve_trial_request_input(task_id, task_version=body.task_version, answer=body.answer)
-        return {"task_id": str(row.task_id), "status": row.status, "task_version": row.task_version}
+        row = _request_input.resolve(task_id=task_id, task_version=body.task_version,
+            idempotency_token=f"trial:{task_id}:answer:{body.task_version}", answer=body.answer,
+            requester_scope=_request_input_owner(authorization))
+        return {"task_id": str(row.task_id), "status": row.status.value, "task_version": row.task_version}
     except (NotFoundError, ConflictError, ForbiddenError, ValidationError_) as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
 

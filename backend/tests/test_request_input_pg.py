@@ -14,6 +14,7 @@ from src.domain.agent.request_input import AgentRequestInputService
 from src.domain.runtime.runtime_service import RuntimeService
 from src.infra.db.agent_repository import SqlAgentRepository
 from src.infra.db.models import (
+    AgentRevisionModel,
     ArtifactVersionModel,
     HumanTaskDecisionModel,
     HumanTaskModel,
@@ -118,3 +119,37 @@ def test_request_input_deadline_fails_original_run_and_rejects_late_answer() -> 
         assert persisted_run is not None and persisted_run.status == RunStatus.FAILED
     with pytest.raises(Exception):
         service.resolve(task_id=task.task_id, task_version=1, idempotency_token="late-answer", answer={"text": "late"}, requester_scope=owner.scoped_id)
+
+
+def test_request_input_enforces_frozen_agent_policy() -> None:
+    service, _runtime, factory, owner, revision, run, pair = _setup()
+    node, attempt = pair
+    with factory.begin() as session:
+        agent_revision = session.get(AgentRevisionModel, revision.revision_id)
+        assert agent_revision is not None
+        agent_revision.body = {
+            **dict(agent_revision.body or {}),
+            "request_input_policy": {
+                "enabled": True, "allowed_schema_refs": ["choice@1"],
+                "max_requests_per_attempt": 1, "max_timeout_minutes": 5,
+                "max_response_bytes": 64,
+            },
+        }
+    with pytest.raises(ValidationError_, match="schema_ref"):
+        service.create(agent_revision_id=revision.revision_id, run_id=run.run_id, node_run_id=node.node_run_id,
+            attempt_id=attempt.attempt_id, schema_ref="text@1", question="Choose", timeout_minutes=1,
+            idempotency_token="bad-schema", requester_scope=owner.scoped_id, input_schema={"type": "object"})
+    with pytest.raises(ValidationError_, match="timeout"):
+        service.create(agent_revision_id=revision.revision_id, run_id=run.run_id, node_run_id=node.node_run_id,
+            attempt_id=attempt.attempt_id, schema_ref="choice@1", question="Choose", timeout_minutes=6,
+            idempotency_token="bad-timeout", requester_scope=owner.scoped_id, input_schema={"type": "object"})
+    with pytest.raises(ValidationError_, match="response size"):
+        service.create(agent_revision_id=revision.revision_id, run_id=run.run_id, node_run_id=node.node_run_id,
+            attempt_id=attempt.attempt_id, schema_ref="choice@1", question="Choose", timeout_minutes=1,
+            idempotency_token="bad-size", requester_scope=owner.scoped_id,
+            input_schema={"type": "object", "max_response_bytes": 65})
+    task = service.create(agent_revision_id=revision.revision_id, run_id=run.run_id, node_run_id=node.node_run_id,
+        attempt_id=attempt.attempt_id, schema_ref="choice@1", question="Choose", timeout_minutes=5,
+        idempotency_token="allowed", requester_scope=owner.scoped_id,
+        input_schema={"type": "object", "max_response_bytes": 64})
+    assert task.schema_ref == "choice@1"

@@ -12,11 +12,24 @@ from src.core.config import settings
 from src.domain.workflow.builtin_registry import ensure_public_business_node_baseline
 from src.domain.workflow.sql_workflow_service import SqlWorkflowService
 from src.infra.db.registry_repository import SqlRegistryService
-from src.infra.db.models import ArtifactVersionModel, NodeRunAttemptModel, NodeRunModel, WorkflowRunModel
+from src.infra.db.models import (
+    ArtifactVersionModel, NodeRunAttemptModel, NodeRunModel, SkillContentModel,
+    SkillRevisionModel, ToolDefinitionModel, ToolRevisionModel, WorkflowRunModel, WorkflowTemplateModel,
+)
+from src.infra.db.session import get_session_factory
 from src.schemas.enums import AttemptStatus, NodeRunStatus, RunStatus
 from src.schemas.models import NodeDefinitionRevision, OwnerScope
 
 pytestmark = pytest.mark.skipif(os.environ.get("TOONFLOW_RUN_PG_TESTS") != "1", reason="set TOONFLOW_RUN_PG_TESTS=1")
+TEMPLATE_ADMIN_HEADERS = {"X-Template-Admin-Key": "template-test-key"}
+
+
+@pytest.fixture(autouse=True)
+def _template_admin_key() -> object:
+    previous = settings.template_internal_admin_key
+    settings.template_internal_admin_key = "template-test-key"
+    yield
+    settings.template_internal_admin_key = previous
 
 
 async def _request(method: str, path: str, **kwargs: object) -> httpx.Response:
@@ -59,7 +72,7 @@ async def test_private_template_detail_and_instantiation_are_owner_only() -> Non
     workflows = SqlWorkflowService()
     workflow = workflows.create_workflow(owner_scope=owner)
     revision = workflows.create_revision_from_draft(workflow.workflow_id, uuid4())
-    created = await _request("POST", "/api/v1/templates", headers={"Authorization": f"Bearer {owner_token}"}, json={"name": "private", "workflow_revision_id": str(revision.revision_id), "visibility": "private"})
+    created = await _request("POST", "/api/v1/templates", headers={"Authorization": f"Bearer {owner_token}", **TEMPLATE_ADMIN_HEADERS}, json={"name": "private", "workflow_revision_id": str(revision.revision_id), "visibility": "private"})
     assert created.status_code == 201
     template_id = created.json()["template_id"]
     assert (await _request("GET", f"/api/v1/templates/{template_id}", headers={"Authorization": f"Bearer {owner_token}"})).status_code == 200
@@ -76,6 +89,109 @@ async def test_legacy_public_run_endpoint_is_not_exposed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_studio_dependency_catalog_is_owner_scoped_and_revision_pinned() -> None:
+    owner_id, owner_token = await _identity()
+    other_id, _ = await _identity()
+    factory = get_session_factory()
+    with factory.begin() as session:
+        skill = SkillContentModel(skill_id=uuid4(), name="eligible", description="", owner_scope=f"user:{owner_id}", body={}, content_hash="s")
+        skill_revision = SkillRevisionModel(revision_id=uuid4(), skill_id=skill.skill_id, revision_number=1, body={"instructions": ["use"]}, content_hash="sr", status="active")
+        foreign = SkillContentModel(skill_id=uuid4(), name="foreign", description="", owner_scope=f"user:{other_id}", body={}, content_hash="f")
+        foreign_revision = SkillRevisionModel(revision_id=uuid4(), skill_id=foreign.skill_id, revision_number=1, body={"instructions": ["no"]}, content_hash="fr", status="active")
+        tool = ToolDefinitionModel(tool_id=uuid4(), name="approved", description="", owner_scope=f"user:{owner_id}")
+        tool_revision = ToolRevisionModel(revision_id=uuid4(), tool_id=tool.tool_id, revision_number=1, body={"operations": [{"id": "read", "disclosure_fields": ["title"]}]}, content_hash="t", status="active", approval_status="approved")
+        rejected_tool = ToolDefinitionModel(tool_id=uuid4(), name="pending", description="", owner_scope=f"user:{owner_id}")
+        rejected_revision = ToolRevisionModel(revision_id=uuid4(), tool_id=rejected_tool.tool_id, revision_number=1, body={}, content_hash="rt", status="active", approval_status="pending")
+        session.add_all([skill, skill_revision, foreign, foreign_revision, tool, tool_revision, rejected_tool, rejected_revision])
+    response = await _request("GET", "/api/v1/agents/studio/dependencies", headers={"Authorization": f"Bearer {owner_token}"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["skills"] == [{"name": "eligible", "description": "", "owner_scope": f"user:{owner_id}", "ref": {"revision_id": str(skill_revision.revision_id)}}]
+    assert body["tools"] == [{"revision_id": str(tool_revision.revision_id), "name": "approved", "description": "", "operations": [{"operation_id": "read", "disclosure_fields": ["title"]}]}]
+
+
+@pytest.mark.asyncio
+async def test_agent_studio_trial_route_rejects_client_injected_provider_result() -> None:
+    _owner_id, token = await _identity()
+    headers = {"Authorization": f"Bearer {token}"}
+    created = await _request("POST", "/api/v1/agents", headers=headers, json={"name": "trial-boundary", "agent_kind": "configurable"})
+    assert created.status_code == 200
+    agent_id = created.json()["agent_id"]
+    draft = await _request("GET", f"/api/v1/agents/{agent_id}/draft", headers=headers)
+    saved = await _request("PUT", f"/api/v1/agents/{agent_id}/draft", headers=headers, json={
+        "base_draft_version": draft.json()["draft_version"],
+        "body": {"sop_steps": [{"step_id": "s", "instruction": "bounded"}], "execution_policy": {"provider_ref": "atlascloud/test"}},
+    })
+    assert saved.status_code == 200
+    rejected = await _request("POST", f"/api/v1/agents/{agent_id}/draft/dry-run", headers=headers, json={
+        "draft_version": saved.json()["draft_version"], "budget": {}, "fixed_input": {}, "simulated_output": {"forged": True},
+    })
+    assert rejected.status_code == 422
+    trial = await _request("POST", f"/api/v1/agents/{agent_id}/draft/dry-run", headers=headers, json={
+        "draft_version": saved.json()["draft_version"], "budget": {"max_cost": 1}, "fixed_input": {"sample": "studio"},
+    })
+    assert trial.status_code == 200
+    assert trial.json()["runtime_run_id"]
+    assert trial.json()["status"] == "completed"
+    assert {entry["phase"] for entry in trial.json()["runtime_timeline"]} >= {"started", "completed"}
+    assert all("secret" not in str(entry).lower() for entry in trial.json()["runtime_timeline"])
+
+
+@pytest.mark.asyncio
+async def test_agent_studio_runtime_trial_persists_typed_schema_failure() -> None:
+    _owner_id, token = await _identity()
+    headers = {"Authorization": f"Bearer {token}"}
+    created = await _request("POST", "/api/v1/agents", headers=headers, json={"name": "trial-schema", "agent_kind": "configurable"})
+    agent_id = created.json()["agent_id"]
+    draft = await _request("GET", f"/api/v1/agents/{agent_id}/draft", headers=headers)
+    saved = await _request("PUT", f"/api/v1/agents/{agent_id}/draft", headers=headers, json={
+        "base_draft_version": draft.json()["draft_version"],
+        "body": {
+            "output_schema_ref": "studio.result.v1",
+            "output_schema": {"type": "object", "required": ["answer"], "properties": {"answer": {"type": "string"}}},
+            "sop_steps": [{"step_id": "typed", "instruction": "return typed answer"}],
+            "execution_policy": {"provider_ref": "atlascloud/test", "max_attempts": 2},
+        },
+    })
+    result = await _request("POST", f"/api/v1/agents/{agent_id}/draft/dry-run", headers=headers,
+        json={"draft_version": saved.json()["draft_version"], "budget": {}, "fixed_input": {}})
+    assert result.status_code == 200
+    body = result.json()
+    assert body["status"] == "failed"
+    assert body["failure_owner"] == "runtime"
+    assert body["runtime_run_id"] and body["runtime_trial_agent_revision_id"]
+
+
+@pytest.mark.asyncio
+async def test_human_gate_timeout_is_not_a_public_owner_action() -> None:
+    _, token = await _identity()
+    response = await _request(
+        "POST", f"/api/v1/runtime/human-tasks/{uuid4()}/timeout",
+        headers={"Authorization": f"Bearer {token}"}, json={},
+    )
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_artifact_lineage_is_canonical_and_referenced_blob_cannot_be_deleted() -> None:
+    _, token = await _identity()
+    headers = {"Authorization": f"Bearer {token}"}
+    attempt_id = uuid4()
+    receipt = {"blob_id": "blob://canonical", "checksum": "canonical-hash", "durability_class": "replicated", "checkpoint": "c", "protected_at": "now", "restore_point_eligible": True, "verified": True}
+    created = await _request("POST", "/api/v1/artifacts/versions", headers=headers, json={
+        "schema_id": "toonflow.shot_plan.v1", "content_uri": "s3://canonical", "blob_uri": "s3://canonical",
+        "content_hash": "canonical-hash", "metadata": {"durability_receipt": receipt},
+        "lineage_input_refs": [{"node_run_attempt_id": str(attempt_id)}],
+    })
+    assert created.status_code == 200
+    lineage = created.json()["lineage_input_refs"][0]
+    assert lineage["source_ref"] == {"node_run_attempt_id": str(attempt_id)}
+    assert lineage["role"] == "input" and lineage["order"] == 0
+    blocked = await _request("POST", "/api/v1/artifacts/blobs/delete-check", headers=headers, json={"blob_uri": "s3://canonical"})
+    assert blocked.status_code == 409
+
+
+@pytest.mark.asyncio
 async def test_registry_mutations_fail_closed_and_require_platform_key() -> None:
     """A bearer/user request must never turn an arbitrary definition active."""
     from src.schemas.models import PortTypeRef
@@ -87,16 +203,21 @@ async def test_registry_mutations_fail_closed_and_require_platform_key() -> None
         policy_metadata={"package_source": "approved:http-contract"},
     )
     previous = settings.registry_internal_admin_key
+    previous_signing = settings.registry_package_signing_key
     settings.registry_internal_admin_key = "registry-test-key"
+    settings.registry_package_signing_key = "registry-signing-key"
     try:
         body = definition.model_dump(mode="json")
         assert (await _request("POST", "/api/v1/registry/definitions", json=body)).status_code == 403
         created = await _request("POST", "/api/v1/registry/definitions", headers={"X-Registry-Admin-Key": "registry-test-key"}, json=body)
         assert created.status_code == 200
+        approved = await _request("POST", f"/api/v1/registry/definitions/{definition.node_type_id}/approve?revision_id={definition.revision_id}", headers={"X-Registry-Admin-Key": "registry-test-key"}, json={"signer_id": "test", "approval_id": "test", "contract_cases": {"mock_success": True, "schema_fail": True, "cancel": True, "security_error": True}})
+        assert approved.status_code == 200
         activated = await _request("POST", f"/api/v1/registry/definitions/{definition.node_type_id}/activate", headers={"X-Registry-Admin-Key": "registry-test-key"}, json={"revision_id": str(definition.revision_id)})
         assert activated.status_code == 200
     finally:
         settings.registry_internal_admin_key = previous
+        settings.registry_package_signing_key = previous_signing
 
 
 @pytest.mark.asyncio
@@ -113,6 +234,145 @@ async def test_control_flow_state_is_owner_scoped() -> None:
             compiled_plan_id=uuid4(), owner_scope=owner.scoped_id))
     assert (await _request("GET", f"/api/v1/control-flow/runs/{run_id}/state", headers={"Authorization": f"Bearer {owner_token}"})).status_code == 200
     assert (await _request("GET", f"/api/v1/control-flow/runs/{run_id}/state", headers={"Authorization": f"Bearer {other_token}"})).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_workflow_import_stays_untrusted_draft_and_revision_history_is_owner_scoped() -> None:
+    owner_id, owner_token = await _identity()
+    _, other_token = await _identity()
+    headers = {"Authorization": f"Bearer {owner_token}"}
+    imported = await _request("POST", "/api/v1/workflows/import", headers=headers, json={
+        "graph": {"nodes": [{"id": "untrusted", "type": "missing.type"}], "edges": []},
+        "config": {}, "layout": {},
+    })
+    assert imported.status_code == 201
+    body = imported.json()
+    assert body["trust_state"] == "untrusted_draft"
+    assert body["active_revision_id"] is None
+    workflow_id = UUID(body["workflow_id"])
+    assert (await _request("GET", f"/api/v1/workflows/{workflow_id}/draft", headers=headers)).status_code == 200
+    # No imported payload can be read by another owner or become runnable by
+    # import alone.
+    assert (await _request("GET", f"/api/v1/workflows/{workflow_id}/revisions", headers={"Authorization": f"Bearer {other_token}"})).status_code == 404
+    assert (await _request("GET", f"/api/v1/workflows/{workflow_id}/revisions", headers=headers)).json()["revisions"] == []
+
+    service = SqlWorkflowService()
+    revision = service.create_revision_from_draft(workflow_id, uuid4())
+    service.retire_revision(revision.revision_id)
+    history = await _request("GET", f"/api/v1/workflows/{workflow_id}/revisions/{revision.revision_id}", headers=headers)
+    assert history.status_code == 200
+    assert history.json()["status"] == "retired"
+    assert history.json()["run_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_workflow_package_import_blocks_secret_and_reports_dependency_locations() -> None:
+    """TF-WF-009: package imports are typed, owner-scoped and Draft-only."""
+    owner_id, owner_token = await _identity()
+    other_id, other_token = await _identity()
+    owner = OwnerScope(kind="user", id=UUID(owner_id))
+    other = OwnerScope(kind="user", id=UUID(other_id))
+    headers = {"Authorization": f"Bearer {owner_token}"}
+    workflows = SqlWorkflowService()
+
+    # A private nested package must not be discoverable/importable by another
+    # owner.  The diagnostic identifies the declared dep, not private content.
+    private_workflow = workflows.create_workflow(owner_scope=other)
+    private_revision = workflows.create_revision_from_draft(private_workflow.workflow_id, uuid4())
+    private = await _request("POST", "/api/v1/templates", headers={"Authorization": f"Bearer {other_token}", **TEMPLATE_ADMIN_HEADERS}, json={
+        "name": "private-package", "workflow_revision_id": str(private_revision.revision_id), "visibility": "private",
+    })
+    assert private.status_code == 201
+    manifest = {
+        "name": "foreign-package", "version": "1.0.0",
+        "dependencies": [{"dep_id": "private-template", "kind": "template", "revision_id": private.json()["template_id"]}],
+    }
+    denied = await _request("POST", "/api/v1/workflows/import", headers=headers, json={"package_manifest": manifest})
+    assert denied.status_code == 422
+    details = denied.json()["detail"]["error"]["details"]
+    assert details["diagnostics"] == [
+        {"code": "ENTITLEMENT_DENIED", "dep_id": "private-template", "kind": "template", "revision_id": private.json()["template_id"], "message": "Nested template is private or unavailable", "path": ["import", "private-template"]},
+    ]
+
+    missing_manifest = {"name": "missing-package", "version": "1.0.0", "dependencies": [{"dep_id": "gone", "kind": "resource", "revision_id": str(uuid4())}]}
+    missing = await _request("POST", "/api/v1/workflows/import", headers=headers, json={"package_manifest": missing_manifest})
+    assert missing.status_code == 422
+    assert missing.json()["detail"]["error"]["details"]["diagnostics"][0]["code"] == "MISSING_DEPENDENCY"
+    assert missing.json()["detail"]["error"]["details"]["diagnostics"][0]["path"] == ["import", "gone"]
+
+    secret = await _request("POST", "/api/v1/workflows/import", headers=headers, json={
+        "graph": {"nodes": [{"id": "bad", "type": "brief", "config": {"CredentialBinding": "must-never-import"}}], "edges": []},
+        "package_manifest": {"name": "unsafe", "version": "1.0.0"},
+    })
+    assert secret.status_code == 422
+    assert secret.json()["detail"]["error"]["code"] == "PACKAGE_FORBIDDEN_CONTENT"
+
+    # Make a durable self-cycle, then import it as a nested package.  The
+    # importer gets an actionable dependency path rather than a generic fail.
+    cyclic_workflow = workflows.create_workflow(owner_scope=owner)
+    cyclic_revision = workflows.create_revision_from_draft(cyclic_workflow.workflow_id, uuid4())
+    cyclic = await _request("POST", "/api/v1/templates", headers={**headers, **TEMPLATE_ADMIN_HEADERS}, json={
+        "name": "cyclic", "workflow_revision_id": str(cyclic_revision.revision_id), "visibility": "private",
+    })
+    assert cyclic.status_code == 201
+    cyclic_id = cyclic.json()["template_id"]
+    with get_session_factory().begin() as session:
+        row = session.get(WorkflowTemplateModel, UUID(cyclic_id))
+        assert row is not None
+        row.manifest = {"name": "cyclic", "version": "1.0.0", "dependencies": [{"dep_id": "again", "kind": "template", "revision_id": cyclic_id}]}
+    cycle = await _request("POST", "/api/v1/workflows/import", headers=headers, json={"package_manifest": {
+        "name": "cycle-wrapper", "version": "1.0.0", "dependencies": [{"dep_id": "root", "kind": "template", "revision_id": cyclic_id}],
+    }})
+    assert cycle.status_code == 422
+    cycle_diagnostic = cycle.json()["detail"]["error"]["details"]["diagnostics"][0]
+    assert cycle_diagnostic["code"] == "TEMPLATE_CYCLE"
+    assert cycle_diagnostic["path"] == ["import", "root", cyclic_id, "again", cyclic_id]
+
+
+@pytest.mark.asyncio
+async def test_workflow_package_import_unlocks_typed_replacement_into_untrusted_draft() -> None:
+    _owner_id, token = await _identity()
+    imported = await _request("POST", "/api/v1/workflows/import", headers={"Authorization": f"Bearer {token}"}, json={
+        "graph": {"nodes": [{"id": "brief", "type": "brief", "config": {}}], "edges": []},
+        "package_manifest": {
+            "name": "typed-provider", "version": "1.0.0",
+            "dependencies": [{"dep_id": "model", "kind": "provider", "revision_id": "atlascloud/pending", "replacement_slot": "model-slot"}],
+            "replacement_slots": [{"slot_id": "model-slot", "label": "Model", "expected_kind": "provider", "required": True}],
+        },
+        "replacements": {"model-slot": "atlascloud/llm/demo"},
+    })
+    assert imported.status_code == 201
+    body = imported.json()
+    assert body["trust_state"] == "untrusted_draft"
+    assert body["active_revision_id"] is None
+    assert body["package_resolution"]["resolution"] == {"model": "atlascloud/llm/demo"}
+    draft = await _request("GET", f"/api/v1/workflows/{body['workflow_id']}/draft", headers={"Authorization": f"Bearer {token}"})
+    assert draft.status_code == 200
+    assert draft.json()["config"]["import_replacement_mapping"] == {"model-slot": "atlascloud/llm/demo"}
+
+
+@pytest.mark.asyncio
+async def test_publish_resolves_latest_at_compile_to_fixed_artifact_version() -> None:
+    _owner_id, token = await _identity()
+    headers = {"Authorization": f"Bearer {token}"}
+    older = await _request("POST", "/api/v1/artifacts/versions", headers=headers, json={"schema_id": "brief", "content_json": {"version": 1}})
+    assert older.status_code == 200
+    artifact_id = older.json()["artifact_id"]
+    newer = await _request("POST", "/api/v1/artifacts/versions", headers=headers, json={"schema_id": "brief", "artifact_id": artifact_id, "content_json": {"version": 2}})
+    assert newer.status_code == 200
+    ensure_public_business_node_baseline(SqlRegistryService())
+    created = await _request("POST", "/api/v1/workflows/", headers=headers, json={})
+    workflow_id = created.json()["workflow_id"]
+    draft = await _request("GET", f"/api/v1/workflows/{workflow_id}/draft", headers=headers)
+    graph = {"nodes": [{"id": "brief", "type": "brief", "config": {"input": {"artifact_id": artifact_id, "artifact_version_id": "latest", "latest_at_compile": True}}}], "edges": []}
+    saved = await _request("PUT", f"/api/v1/workflows/{workflow_id}/draft", headers=headers, json={"graph": graph, "config": {}, "layout": {}, "base_graph_hash": draft.json()["graph_hash"]})
+    assert saved.status_code == 200
+    published = await _request("POST", f"/api/v1/workflows/{workflow_id}/revisions", headers=headers)
+    assert published.status_code == 201, published.text
+    fixed = await _request("GET", f"/api/v1/workflows/{workflow_id}/revisions/{published.json()['revision_id']}", headers=headers)
+    ref = fixed.json()["graph"]["nodes"][0]["config"]["input"]
+    assert ref["artifact_version_id"] == newer.json()["artifact_version_id"]
+    assert "latest_at_compile" not in ref
 
 
 @pytest.mark.asyncio
@@ -191,7 +451,7 @@ async def test_typed_sop_trace_lineage_lists_without_500_or_cross_owner_leak() -
             ),
             ArtifactVersionModel(
                 artifact_version_id=foreign_id, artifact_id=uuid4(), schema_id="toonflow.agent_sop_trace",
-                schema_version=1, owner_scope=f"user:{uuid4()}", content_json={"secret": "not visible"},
+                schema_version=1, owner_scope=f"user:{uuid4()}", content_json={"phase": "hidden", "secret": "not visible"},
                 content_hash="foreign-trace", content_uri="", blob_uri="",
                 lineage_input_refs=[{"node_run_attempt_id": str(uuid4())}], metadata_json={},
             ),
@@ -213,13 +473,21 @@ async def test_typed_sop_trace_lineage_lists_without_500_or_cross_owner_leak() -
 async def test_template_rejects_invalid_pinned_revision_with_structured_diagnostic() -> None:
     _, token = await _identity()
     response = await _request(
-        "POST", "/api/v1/templates", headers={"Authorization": f"Bearer {token}"},
+        "POST", "/api/v1/templates", headers={"Authorization": f"Bearer {token}", **TEMPLATE_ADMIN_HEADERS},
         json={"name": "invalid-source", "workflow_revision_id": "not-a-uuid"},
     )
     assert response.status_code == 422
     detail = response.json()["detail"]["error"]
     assert detail["code"] == "VALIDATION_ERROR"
     assert detail["details"]["diagnostics"][0]["code"] == "INVALID_UUID"
+
+
+@pytest.mark.asyncio
+async def test_template_platform_mutations_require_maintainer_key() -> None:
+    _, token = await _identity()
+    headers = {"Authorization": f"Bearer {token}"}
+    assert (await _request("POST", "/api/v1/templates", headers=headers, json={"name": "blocked", "workflow_revision_id": str(uuid4())})).status_code == 403
+    assert (await _request("POST", "/api/v1/templates/benchmarks/seed", headers=headers, json={})).status_code == 403
 
 
 @pytest.mark.asyncio
@@ -245,7 +513,7 @@ async def test_template_instance_and_resource_mutations_are_owner_scoped() -> No
         draft.graph_hash,
     )
     revision = workflows.create_revision_from_draft(workflow.workflow_id, snapshot.snapshot_id)
-    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    owner_headers = {"Authorization": f"Bearer {owner_token}", **TEMPLATE_ADMIN_HEADERS}
     other_headers = {"Authorization": f"Bearer {other_token}"}
     template = await _request(
         "POST", "/api/v1/templates", headers=owner_headers,
@@ -372,7 +640,7 @@ async def test_template_gallery_does_not_leak_private_packages() -> None:
     workflows = SqlWorkflowService()
     workflow = workflows.create_workflow(owner_scope=owner)
     revision = workflows.create_revision_from_draft(workflow.workflow_id, uuid4())
-    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    owner_headers = {"Authorization": f"Bearer {owner_token}", **TEMPLATE_ADMIN_HEADERS}
     other_headers = {"Authorization": f"Bearer {other_token}"}
     created = await _request(
         "POST", "/api/v1/templates", headers=owner_headers,

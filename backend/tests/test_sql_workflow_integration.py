@@ -11,6 +11,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import text
 
+from src.core.exceptions import ConflictError
 from src.domain.workflow.sql_workflow_service import SqlWorkflowService
 from src.infra.db.session import get_session_factory
 from src.schemas.models import OwnerScope
@@ -57,3 +58,35 @@ def test_workflow_persists_across_service_instances(sql_service: SqlWorkflowServ
     finally:
         if created:
             sql_service.delete_workflow(workflow_id)
+
+
+def test_required_human_gate_cannot_be_removed_or_downgraded_from_draft(sql_service: SqlWorkflowService) -> None:
+    """WF-008 AC-4: CAS saves preserve workflow-owned required Gates."""
+    workflow = sql_service.create_workflow(owner_scope=OwnerScope(kind="user", id=uuid4()))
+    initial = sql_service.get_draft(workflow.workflow_id)
+    gate_graph = {
+        "nodes": [{
+            "id": "rights-gate", "type": "human_gate",
+            "config": {"policy_strength": "policy_required", "timeout_minutes": 5},
+        }],
+        "edges": [],
+    }
+    saved = sql_service.save_draft(
+        workflow.workflow_id, graph=gate_graph, config={}, layout={},
+        base_graph_hash=initial.graph_hash,
+    )
+    with pytest.raises(ConflictError, match="Human Gate"):
+        sql_service.save_draft(
+            workflow.workflow_id, graph={"nodes": [], "edges": []}, config={}, layout={},
+            base_graph_hash=saved.graph_hash,
+        )
+    with pytest.raises(ConflictError, match="Human Gate"):
+        sql_service.save_draft(
+            workflow.workflow_id,
+            graph={"nodes": [{
+                "id": "rights-gate", "type": "human_gate",
+                "config": {"policy_strength": "advisory"},
+            }], "edges": []},
+            config={}, layout={}, base_graph_hash=saved.graph_hash,
+        )
+    assert sql_service.get_draft(workflow.workflow_id).graph == gate_graph

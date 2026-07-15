@@ -6,6 +6,7 @@ Includes the human-task lifecycle (create / list / get / resolve / reject
 from __future__ import annotations
 
 import hmac
+import json
 from typing import Any
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
@@ -472,18 +473,43 @@ async def reconcile_atlascloud(x_worker_key: str | None = Header(None)) -> dict[
 
 
 @router.post("/callbacks/atlascloud")
-async def atlascloud_callback(request: Request, x_atlas_signature: str | None = Header(None)) -> dict[str, Any]:
-    """Signed provider callback.  It can only address a pre-bound task id."""
+async def atlascloud_callback(
+    request: Request,
+    x_atlascloud_webhook_id: str | None = Header(None),
+    x_atlascloud_event: str | None = Header(None),
+    x_atlascloud_timestamp: str | None = Header(None),
+    x_atlascloud_signature_ed25519: str | None = Header(None),
+    x_atlascloud_key_id: str | None = Header(None),
+    x_atlascloud_signature: str | None = Header(None),
+) -> dict[str, Any]:
+    """Verify and ingest a documented AtlasCloud at-least-once webhook."""
     raw = await request.body()
-    from src.domain.provider.atlascloud import AtlasCloudAdapter
-    if not AtlasCloudAdapter.verify_webhook(body=raw, signature=x_atlas_signature or "", secret=settings.atlascloud_webhook_secret):
+    from src.domain.provider.atlascloud import AtlasCloudAdapter, AtlasWebhookVerifier
+    verified = AtlasWebhookVerifier.verify(
+        body=raw, timestamp=x_atlascloud_timestamp or "",
+        signature=x_atlascloud_signature_ed25519 or "", key_id=x_atlascloud_key_id or "",
+        base_url=settings.atlascloud_base_url,
+    )
+    # Explicit migration path only.  The former X-Atlas-Signature header is
+    # intentionally not accepted because it was never an AtlasCloud header.
+    if not verified and settings.atlascloud_legacy_webhook_hmac_enabled:
+        verified = AtlasCloudAdapter.verify_webhook(
+            body=raw, signature=x_atlascloud_signature or "", secret=settings.atlascloud_webhook_secret,
+        )
+    if not verified:
         raise HTTPException(status_code=401, detail="Invalid AtlasCloud callback signature")
     try:
-        payload = await request.json()
+        payload = json.loads(raw)
     except Exception as exc:
         raise HTTPException(status_code=422, detail="Invalid AtlasCloud callback JSON") from exc
     if not isinstance(payload, dict):
         raise HTTPException(status_code=422, detail="AtlasCloud callback must be an object")
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not session_id or session_id != x_atlascloud_webhook_id:
+        raise HTTPException(status_code=401, detail="AtlasCloud callback session mismatch")
+    event_type = payload.get("event_type")
+    if not isinstance(event_type, str) or not x_atlascloud_event or event_type != x_atlascloud_event:
+        raise HTTPException(status_code=422, detail="AtlasCloud callback event mismatch")
     try:
         receipt = _worker.ingest_atlas_callback(payload)
     except (ConflictError, NotFoundError) as exc:
@@ -600,13 +626,12 @@ async def reject_human_task(task_id: UUID, body: RejectHumanTaskRequest, authori
 
 
 @router.post("/human-tasks/{task_id}/timeout")
-async def timeout_human_task(task_id: UUID, body: TimeoutHumanTaskRequest, authorization: str | None = Header(None)) -> dict[str, Any]:
-    """Mark the gate as expired. Idempotent."""
+async def timeout_human_task(task_id: UUID, x_worker_key: str | None = Header(None)) -> dict[str, Any]:
+    """Internal deadline scanner command; users cannot force early timeout."""
     try:
-        actor_id, owner = _resolve_actor(authorization)
+        _require_worker(x_worker_key)
         task = _runtime.timeout_human_task(
-            task_id, reason=body.reason or "", actor_id=actor_id, actor_scope=owner.scoped_id,
-            task_version=body.task_version, idempotency_key=body.idempotency_token, internal=False,
+            task_id, reason="worker deadline scanner", internal=True,
         )
     except NotFoundError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.to_dict())

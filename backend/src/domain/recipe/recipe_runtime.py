@@ -14,7 +14,7 @@ from src.infra.db.models import (
     ProviderInvocationRecordModel, ProviderOutputBindingModel, WorkflowRunModel,
 )
 from src.infra.db.session import get_session_factory
-from src.schemas.enums import AttemptStatus, NodeRunStatus
+from src.schemas.enums import AttemptStatus, NodeRunStatus, RunStatus
 from src.domain.runtime.runtime_service import RuntimeService
 from src.domain.provider.atlascloud import AtlasCloudAdapter, AtlasSubmissionUnknown
 
@@ -81,26 +81,57 @@ class RecipeRuntimeService:
             if attempt is None:
                 raise NotFoundError("Recipe operator attempt", str(attempt_id))
             step = dict((attempt.fixed_input or {}).get("operator", {}))
+            expected_epoch = int(attempt.execution_epoch)
+            node = session.get(NodeRunModel, attempt.node_run_id)
+            run = session.get(WorkflowRunModel, node.run_id) if node is not None else None
+            if run is None:
+                raise NotFoundError("Recipe operator WorkflowRun", str(attempt_id))
         operation = {"atlas_llm": "llm", "atlas_image": "image", "atlas_video": "video"}.get(str(step.get("operator")))
         if operation is None or not step.get("model_id"):
             raise ValidationError_("Recipe child is not a configured Atlas operator")
         runtime = RuntimeService(session_factory=self._factory)
-        provider, outbox = runtime.dispatch_provider(attempt_id, provider_id="atlascloud", model_id=str(step["model_id"]), idempotency_key=idempotency_key, request_body_hash="recipe:" + str(attempt_id))
+        request = {
+            "input": (attempt.fixed_input or {}).get("root_inputs", {}),
+            "parameters": step.get("parameters", {}),
+        }
+        provider, outbox = runtime.dispatch_provider(
+            attempt_id, provider_id="atlascloud", model_id=str(step["model_id"]),
+            idempotency_key=idempotency_key, request_body_hash="recipe:" + str(attempt_id),
+            dispatch_payload={
+                "operation": operation,
+                "request": request,
+                "expected_epoch": expected_epoch,
+                "result_schema": {"schema_id": "media_output", "schema_version": 1, "owner_scope": run.owner_scope},
+                "kind": "recipe_operator",
+            },
+        )
         try:
-            result = adapter.submit(operation=operation, model_id=str(step["model_id"]), payload={"input": (attempt.fixed_input or {}).get("root_inputs", {}), "parameters": step.get("parameters", {})}, idempotency_key=idempotency_key)
+            result = adapter.submit(operation=operation, model_id=str(step["model_id"]), payload=request, idempotency_key=idempotency_key)
         except AtlasSubmissionUnknown:
             runtime.mark_provider_unknown(provider.provider_attempt_id)
             return {"status": "unknown", "provider_attempt_id": provider.provider_attempt_id, "outbox_event_id": outbox.event_id}
-        if result.task_id:
+        if operation in {"image", "video"}:
+            # A media 2xx is only a submission acknowledgement. Without the
+            # documented prediction id it cannot be reconciled safely, so do
+            # not present it as a dispatched/publishable result.
+            if not result.asynchronous or result.task_id is None:
+                runtime.mark_provider_unknown(provider.provider_attempt_id)
+                return {"status": "unknown", "provider_attempt_id": provider.provider_attempt_id, "outbox_event_id": outbox.event_id}
             runtime.bind_provider_task(provider.provider_attempt_id, result.task_id)
         return {"status": "submitted", "provider_attempt_id": provider.provider_attempt_id, "outbox_event_id": outbox.event_id}
 
     def publish_external_result(self, *, provider_attempt_id: UUID, owner_scope: str, outputs: list[dict[str, Any]], model_version: str, fingerprint: str, usage: dict[str, Any], cost: float) -> list[UUID]:
         """Publish an external operator result then advance its DAG child."""
         runtime = RuntimeService(session_factory=self._factory)
+        with self._factory() as session:
+            provider_attempt = session.get(ProviderInvocationAttemptModel, provider_attempt_id)
+            child = session.get(NodeRunAttemptModel, provider_attempt.node_run_attempt_id) if provider_attempt else None
+            if child is None:
+                raise NotFoundError("ProviderInvocationAttempt", str(provider_attempt_id))
+            expected_epoch = int(child.execution_epoch)
         record, _, artifacts = runtime.publish_provider_json_outputs(provider_attempt_id, owner_scope=owner_scope,
             schema_id="media_output", schema_version=1, outputs=outputs, model_version=model_version,
-            response_fingerprint=fingerprint, usage=usage, actual_cost=cost)
+            response_fingerprint=fingerprint, usage=usage, actual_cost=cost, current_epoch=expected_epoch)
         with self._factory() as session:
             provider_attempt = session.get(ProviderInvocationAttemptModel, provider_attempt_id)
             if provider_attempt is None:
@@ -184,12 +215,22 @@ class RecipeRuntimeService:
                 raise ValidationError_("Recipe failure_policy must be fail_fast or collect_errors")
 
     def fallback_attempt(self, attempt_id: UUID) -> UUID:
-        """Create a new fenced attempt after rechecking its frozen recipe plan."""
+        """Create a new fenced attempt after a fresh fallback decision.
+
+        A fallback never mutates the failed attempt.  It recompiles the
+        frozen recipe body and records the newly observed capability,
+        authorization and cost decision on the new attempt before a separate
+        provider dispatch can be created for it.
+        """
         with self._factory.begin() as session:
             old = session.get(NodeRunAttemptModel, attempt_id)
             if old is None or old.status != AttemptStatus.FAILED:
                 raise ConflictError("Recipe fallback requires a failed child after unknown reconciliation")
             fixed = dict(old.fixed_input or {})
+            node = session.get(NodeRunModel, old.node_run_id)
+            run = session.get(WorkflowRunModel, node.run_id) if node is not None else None
+            if node is None or run is None or run.status != RunStatus.RUNNING:
+                raise ConflictError("Recipe fallback requires an active owner-scoped run")
             body = fixed.get("recipe_body")
             step_id = str(fixed.get("operator", {}).get("id", ""))
             if not isinstance(body, dict) or not step_id:
@@ -198,6 +239,12 @@ class RecipeRuntimeService:
             replacement = next((step for step in recompiled["compiled_plan"]["steps"] if step["id"] == step_id), None)
             if replacement is None:
                 raise ConflictError("Recipe fallback operator is absent from recompiled plan")
+            capability_snapshot = dict(replacement.get("capability_snapshot") or {})
+            if capability_snapshot.get("provider") != "atlascloud":
+                raise ConflictError("Recipe fallback may only dispatch AtlasCloud capabilities")
+            estimate = replacement.get("parameters", {}).get("estimated_cost", 0)
+            if not isinstance(estimate, (int, float)) or estimate < 0:
+                raise ConflictError("Recipe fallback has an invalid cost estimate")
             # Recompile is also the capability/policy gate.  Persist the
             # resulting snapshot and fresh cost estimate for audit rather than
             # silently reusing a stale external request contract.
@@ -205,9 +252,14 @@ class RecipeRuntimeService:
             fixed["recipe_plan_hash"] = recompiled["plan_hash"]
             fixed["fallback_recheck"] = {
                 "plan_hash": recompiled["plan_hash"],
-                "capability_snapshot": replacement.get("capability_snapshot", {}),
-                "provider_policy": "atlascloud-only",
-                "cost_estimate": replacement.get("parameters", {}).get("estimated_cost", 0),
+                "capability_snapshot": capability_snapshot,
+                "authorization_decision": {
+                    "allowed": True,
+                    "owner_scope": run.owner_scope,
+                    "provider": "atlascloud",
+                    "reason": "active_owner_scoped_run",
+                },
+                "cost_estimate": estimate,
             }
             new = NodeRunAttemptModel(attempt_id=uuid4(), node_run_id=old.node_run_id,
                 attempt_number=int(old.attempt_number or 1) + 1, execution_epoch=int(old.execution_epoch or 1) + 1,

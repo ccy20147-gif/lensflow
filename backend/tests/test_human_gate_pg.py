@@ -13,12 +13,14 @@ from __future__ import annotations
 import os
 import uuid
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
 from sqlalchemy import select
 
 from src.domain.runtime.runtime_service import RuntimeService
+from src.domain.runtime.worker import RuntimeWorker
 from src.infra.db.models import (
     HumanTaskModel,
     HumanTaskDecisionModel,
@@ -547,3 +549,61 @@ class TestHumanGatePersistence:
         other_token = get_session_store().issue(uuid.uuid4())["token"]
         denied = asyncio.run(request(other_token))
         assert denied.status_code == 404
+
+
+def test_gate_acceptance_schedules_all_parallel_downstream_nodes(factory) -> None:
+    """One accepted gate atomically opens both independent successors."""
+    owner_id, workflow_id, revision_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    graph = {
+        "nodes": [
+            {"id": "gate", "type": "human_gate", "config": {"timeout_minutes": 5}},
+            {"id": "left", "type": "provider"}, {"id": "right", "type": "provider"},
+        ],
+        "edges": [{"source": "gate", "target": "left"}, {"source": "gate", "target": "right"}],
+    }
+    with factory.begin() as session:
+        session.add(WorkflowModel(workflow_id=workflow_id, owner_scope=f"user:{owner_id}"))
+        session.add(WorkflowRevisionModel(revision_id=revision_id, workflow_id=workflow_id, revision_number=1,
+            graph=graph, graph_hash="gate", execution_hash="gate", registry_snapshot_id=uuid.uuid4(), revision_status=RevisionStatus.ACTIVE))
+    plan = CompiledExecutionPlan(plan_id=uuid.uuid4(), workflow_revision_id=revision_id,
+        registry_snapshot=RegistrySnapshot(snapshot_id=uuid.uuid4()), resolved_graph=graph, plan_hash="parallel-gate")
+    runtime = RuntimeService(factory)
+    run = runtime.create_run(compiled_plan=plan, owner_scope=OwnerScope(kind="user", id=owner_id))
+    runtime.start_run(run.run_id)
+    with factory() as session:
+        task = session.scalar(select(HumanTaskModel).where(HumanTaskModel.run_id == run.run_id))
+        assert task is not None
+    runtime.resolve_human_task(task.task_id)
+    with factory() as session:
+        nodes = {row.node_instance_id: row for row in session.scalars(select(NodeRunModel).where(NodeRunModel.run_id == run.run_id))}
+        attempts = list(session.scalars(select(NodeRunAttemptModel).where(NodeRunAttemptModel.node_run_id.in_([nodes["left"].node_run_id, nodes["right"].node_run_id]))))
+        persisted_run = session.get(WorkflowRunModel, run.run_id)
+        assert nodes["gate"].status == NodeRunStatus.COMPLETED
+        assert nodes["left"].status == nodes["right"].status == NodeRunStatus.READY
+        assert len(attempts) == 2 and all(row.status.value == "pending" for row in attempts)
+        assert persisted_run is not None and persisted_run.status == RunStatus.RUNNING
+
+
+def test_deadline_scanner_survives_restart_and_public_timeout_is_rejected(factory) -> None:
+    runtime = RuntimeService(factory)
+    revision_id = uuid.uuid4()
+    with factory.begin() as session:
+        workflow_id = uuid.uuid4()
+        session.add(WorkflowModel(workflow_id=workflow_id, owner_scope="user:test"))
+        session.add(WorkflowRevisionModel(revision_id=revision_id, workflow_id=workflow_id, revision_number=1,
+            graph_hash="timeout", execution_hash="timeout", registry_snapshot_id=uuid.uuid4(), revision_status=RevisionStatus.ACTIVE))
+    run = runtime.create_run(compiled_plan=CompiledExecutionPlan(plan_id=uuid.uuid4(), workflow_revision_id=revision_id,
+        registry_snapshot=RegistrySnapshot(snapshot_id=uuid.uuid4()), resolved_graph={"nodes": [{"id": "n", "type": "provider"}], "edges": []}, plan_hash="timeout"), owner_scope=OwnerScope(kind="user", id=uuid.uuid4()))
+    with factory() as session:
+        node = session.scalar(select(NodeRunModel).where(NodeRunModel.run_id == run.run_id))
+        assert node is not None
+    attempt = runtime.create_attempt(node.node_run_id)
+    task = runtime.create_human_task(run_id=run.run_id, node_run_id=node.node_run_id, attempt_id=attempt.attempt_id, timeout_minutes=1)
+    with factory.begin() as session:
+        row = session.get(HumanTaskModel, task.task_id)
+        assert row is not None
+        row.created_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=2)
+    # A fresh worker proves deadline authority is durable and restart-safe.
+    assert RuntimeWorker(factory).expire_due_human_tasks() >= 1
+    with factory() as session:
+        assert session.get(HumanTaskModel, task.task_id).status == HumanTaskStatus.EXPIRED

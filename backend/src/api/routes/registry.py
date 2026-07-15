@@ -12,6 +12,8 @@ from __future__ import annotations
 import hmac
 from typing import Any
 from uuid import UUID
+from datetime import datetime, timezone
+import hashlib
 
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
@@ -46,8 +48,18 @@ class RegisterConverterRequest(BaseModel):
     executor_digest: str
 
 
+class DispatchConverterRequest(RegisterConverterRequest):
+    value: dict[str, Any]
+
+
 class ActivateDefinitionRequest(BaseModel):
     revision_id: UUID
+
+
+class ApproveDefinitionRequest(BaseModel):
+    signer_id: str
+    approval_id: str
+    contract_cases: dict[str, bool]
 
 
 class RetireDefinitionRequest(BaseModel):
@@ -84,6 +96,34 @@ async def activate_definition(node_type_id: str, body: ActivateDefinitionRequest
         return _registry.activate_node_definition(node_type_id, body.revision_id)
     except NotFoundError as e:
         raise HTTPException(status_code=e.status_code, detail=e.to_dict())
+
+
+@router.post("/definitions/{node_type_id}/approve")
+async def approve_definition(node_type_id: str, body: ApproveDefinitionRequest, revision_id: UUID, x_registry_admin_key: str | None = Header(default=None)) -> dict[str, str]:
+    """Persist platform HMAC approval and required contract-test manifest."""
+    _require_platform_admin(x_registry_admin_key)
+    if not settings.registry_package_signing_key:
+        raise HTTPException(status_code=409, detail="Registry package signing key is not configured")
+    from src.infra.db.models import ApprovedNodePackageModel, NodeContractTestRunModel
+    from src.infra.db.models import NodeDefinitionModel
+    from src.infra.db.session import get_session_factory
+    required = {"mock_success", "schema_fail", "cancel", "security_error"}
+    if set(body.contract_cases) != required:
+        raise HTTPException(status_code=422, detail="contract_cases must contain mock_success/schema_fail/cancel/security_error")
+    with get_session_factory().begin() as session:
+        node = session.get(NodeDefinitionModel, revision_id)
+        if node is None or node.node_type_id != node_type_id:
+            raise HTTPException(status_code=404, detail="NodeDefinitionRevision not found")
+        signature = hmac.new(settings.registry_package_signing_key.encode(), node.content_hash.encode(), hashlib.sha256).hexdigest()
+        existing = session.query(ApprovedNodePackageModel).filter(ApprovedNodePackageModel.revision_id == revision_id).one_or_none()
+        if existing is None:
+            session.add(ApprovedNodePackageModel(revision_id=revision_id, content_hash=node.content_hash, signer_id=body.signer_id, signature=signature, approval_id=body.approval_id, created_at=datetime.now(timezone.utc)))
+        else:
+            existing.content_hash, existing.signer_id, existing.signature, existing.approval_id = node.content_hash, body.signer_id, signature, body.approval_id
+        session.query(NodeContractTestRunModel).filter(NodeContractTestRunModel.revision_id == revision_id).delete()
+        for name, passed in body.contract_cases.items():
+            session.add(NodeContractTestRunModel(revision_id=revision_id, case_name=name, passed=passed, evidence={}, created_at=datetime.now(timezone.utc)))
+    return {"status": "approved"}
 
 
 @router.post("/definitions/{node_type_id}/retire", response_model=NodeDefinitionRevision)
@@ -160,6 +200,12 @@ async def list_converters() -> dict[str, Any]:
     return {"converters": converters}
 
 
+@router.post("/converters/dispatch")
+async def dispatch_converter(body: DispatchConverterRequest, x_registry_admin_key: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_platform_admin(x_registry_admin_key)
+    return {"value": _registry.dispatch_converter(from_schema_id=body.from_schema_id, from_schema_version=body.from_schema_version, to_schema_id=body.to_schema_id, to_schema_version=body.to_schema_version, value=body.value)}
+
+
 # ------------------------------------------------------------------
 # Registry Snapshot endpoints
 # ------------------------------------------------------------------
@@ -217,7 +263,6 @@ async def catalog(authorization: str | None = Header(None)) -> dict[str, Any]:
                 # to a newer definition with the same type id.
                 "revision_id": str(d.revision_id),
                 "semantic_version": d.semantic_version,
-                "executor_ref": d.executor_ref,
                 "label": d.node_type_id,
                 "input_ports": [p.model_dump(mode="json") for p in d.input_ports],
                 "output_ports": [p.model_dump(mode="json") for p in d.output_ports],

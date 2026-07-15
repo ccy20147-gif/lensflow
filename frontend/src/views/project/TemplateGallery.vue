@@ -3,10 +3,10 @@ import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   getTemplate,
+  getTemplateReplacementOptions,
   instantiateTemplate,
   listTemplates,
   resolveTemplateDependencies,
-  seedBenchmarkTemplates,
   type TemplateDependencyResolution,
   type TemplateDetail,
   type TemplateSummary,
@@ -18,12 +18,12 @@ const templates = ref<TemplateSummary[]>([])
 const selected = ref<TemplateDetail | null>(null)
 const resolution = ref<TemplateDependencyResolution | null>(null)
 const replacements = ref<Record<string, string>>({})
+const replacementOptions = ref<Record<string, Array<{ revision_id: string; label: string }>>>({})
 const projectName = ref('')
 const parametersText = ref('{}')
 const loading = ref(true)
 const instantiating = ref(false)
 const error = ref('')
-const seeding = ref(false)
 
 const projectId = computed(() => String(route.params.projectId || ''))
 
@@ -39,9 +39,12 @@ async function selectTemplate(templateId: string) {
   error.value = ''
   resolution.value = null
   replacements.value = {}
+  replacementOptions.value = {}
   try {
     selected.value = await getTemplate(templateId)
     for (const slot of selected.value.manifest?.replacement_slots || []) replacements.value[slot.slot_id] = ''
+    const options = await getTemplateReplacementOptions(templateId)
+    replacementOptions.value = Object.fromEntries(options.slots.map((slot) => [slot.slot_id, slot.candidates]))
     await checkDependencies()
   } catch (cause) { error.value = cause instanceof Error ? cause.message : String(cause) }
 }
@@ -68,16 +71,6 @@ async function instantiate() {
   finally { instantiating.value = false }
 }
 
-async function seedBenchmarks() {
-  seeding.value = true
-  error.value = ''
-  try {
-    await seedBenchmarkTemplates()
-    await loadTemplates()
-  } catch (cause) { error.value = cause instanceof Error ? cause.message : String(cause) }
-  finally { seeding.value = false }
-}
-
 onMounted(loadTemplates)
 </script>
 
@@ -89,7 +82,6 @@ onMounted(loadTemplates)
         <p class="hint">从固定修订创建可编辑的独立工作流。</p>
       </div>
       <div class="header-actions">
-        <button class="seed-benchmarks-btn" :disabled="seeding" @click="seedBenchmarks">{{ seeding ? '正在创建…' : '创建官方基准模板' }}</button>
         <button class="icon-button" title="刷新模板" aria-label="刷新模板" @click="loadTemplates">↻</button>
       </div>
     </header>
@@ -112,7 +104,10 @@ onMounted(loadTemplates)
         </dl>
         <div v-for="slot in selected.manifest?.replacement_slots || []" :key="slot.slot_id" class="field">
           <label :for="`replacement-${slot.slot_id}`">{{ slot.label }}<span v-if="slot.required"> *</span></label>
-          <input :id="`replacement-${slot.slot_id}`" v-model="replacements[slot.slot_id]" :placeholder="slot.description || '选择固定修订'" @change="checkDependencies" />
+          <select :id="`replacement-${slot.slot_id}`" v-model="replacements[slot.slot_id]" @change="checkDependencies">
+            <option value="">{{ slot.description || '选择固定修订' }}</option>
+            <option v-for="option in replacementOptions[slot.slot_id] || []" :key="option.revision_id" :value="option.revision_id">{{ option.label }} · {{ option.revision_id.slice(0, 8) }}</option>
+          </select>
         </div>
         <p v-if="resolution && !resolution.resolved" class="warning">需先解决：{{ [...resolution.missing, ...resolution.unresolved_slots].join('、') }}</p>
         <textarea v-model="parametersText" rows="4" aria-label="模板参数" placeholder="{}" />
@@ -144,7 +139,7 @@ h2, h3 { color: var(--text-primary); margin: 0; }
 .template-detail p { margin: 0; color: var(--text-secondary); font-size: 13px; }
 dl { display: flex; gap: 24px; margin: 2px 0; } dt { color: var(--text-secondary); font-size: 12px; } dd { margin: 2px 0 0; font-family: monospace; font-size: 12px; }
 .field { display: grid; gap: 4px; } label { font-size: 13px; color: var(--text-primary); }
-input, textarea { box-sizing: border-box; width: 100%; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-primary); color: var(--text-primary); padding: 8px; font: inherit; }
+input, textarea, select { box-sizing: border-box; width: 100%; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-primary); color: var(--text-primary); padding: 8px; font: inherit; }
 textarea { font-family: monospace; font-size: 12px; }
 .instantiate-btn { align-self: flex-start; padding: 8px 14px; border: 0; border-radius: 4px; background: var(--accent); color: white; cursor: pointer; }
 .instantiate-btn:disabled { opacity: 0.55; cursor: not-allowed; }

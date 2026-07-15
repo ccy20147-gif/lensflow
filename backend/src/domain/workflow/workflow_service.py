@@ -18,6 +18,7 @@ from .draft_revision import (
     compute_diff,
     create_draft,
     create_revision,
+    required_human_gate_ids,
     WorkflowDiff,
 )
 
@@ -116,6 +117,17 @@ class WorkflowService:
                     f"WorkflowDraft {workflow_id} 冲突: "
                     f"base_hash {base_graph_hash} 不匹配当前 {current_draft.graph_hash}"
                 )
+            )
+
+        protected = required_human_gate_ids(current_draft.graph)
+        active = self.get_active_revision(workflow_id)
+        if active is not None:
+            protected.update(required_human_gate_ids(active.graph))
+        removed = protected - required_human_gate_ids(graph)
+        if removed:
+            raise ConflictError(
+                "domain_required 或 policy_required Human Gate 不得从 Draft 或 Patch 删除",
+                details={"required_gate_node_ids": sorted(removed)},
             )
 
         # Compute new hashes

@@ -9,6 +9,8 @@ import RegistryNode from './RegistryNode.vue'
 import { catalogNodeAvailable, catalogNodeCompatible, draftNodeToCanvasNode, filterCatalog, isUnknownDefinition, layoutPositions, portsCompatible, serializeCanvasNode, type CanvasCatalogNode, type CanvasPortDef } from './canvasRegistry'
 import { useProjectStore } from '@/stores/project'
 import { apiGet, apiPost, apiPut, publishWorkflowRevision, startWorkflowRun } from '@/api/client'
+import { discardDraft, queueDraft, takeDraft } from './offlineDraftQueue'
+import { inspectorPlugin } from './inspectorPlugins'
 
 const route = useRoute()
 const store = useProjectStore()
@@ -35,6 +37,8 @@ const compatibilityFilter = ref<'all' | 'compatible' | 'incompatible'>('all')
 const connectionError = ref('')
 const runStatus = ref('')
 const architectProposalId = ref('')
+const architectIntent = ref('')
+const architectGenerating = ref(false)
 const architectDiff = ref<any>(null)
 const architectError = ref('')
 const architectApplying = ref(false)
@@ -48,6 +52,7 @@ const restoringHistory = ref(false)
 const nodeTypes = { registry: RegistryNode }
 const categories = computed(() => [...new Set(catalogNodes.value.map((node) => node.category).filter(Boolean))])
 const selectedDefinition = computed<CatalogNode | undefined>(() => selectedNode.value?.data?.definition)
+const selectedInspectorPlugin = computed(() => inspectorPlugin(String(selectedNode.value?.data?.node_type_id || '')))
 
 function isCatalogNodeCompatible(candidate: CatalogNode) {
   return catalogNodeCompatible(selectedDefinition.value, candidate)
@@ -92,6 +97,24 @@ function onOnline() {
   networkOffline.value = false
   // Restore editing only after the authoritative registry has been fetched.
   void loadCatalog()
+  void replayOfflineDraft()
+}
+
+async function replayOfflineDraft() {
+  if (!workflowId || registryError.value) return
+  const queued = await takeDraft(workflowId)
+  if (!queued) return
+  try {
+    const result = await apiPut<any>(`/workflows/${workflowId}/draft`, queued.payload)
+    currentGraphHash.value = result.graph_hash || currentGraphHash.value
+    draftVersion.value = result.draft_version || draftVersion.value
+    await discardDraft(workflowId)
+    saveError.value = ''
+  } catch (error: any) {
+    saveError.value = error?.status === 409
+      ? '离线草稿与服务器版本冲突：本地修改已保留，请刷新后合并。'
+      : '离线草稿仍待同步。'
+  }
 }
 
 function cloneGraph(value: { nodes: any[]; edges: any[] }) {
@@ -317,7 +340,7 @@ async function saveDraft() {
     // Layout is deliberately excluded from the executable graph.  Moving a
     // node must not change a compiled plan or invalidate a running revision.
     const positions = Object.fromEntries(graph.nodes.map((node: any) => [node.id, node.position]))
-    const result = await apiPut<any>(`/workflows/${workflowId}/draft`, {
+    const payload = {
       graph: {
         nodes: graph.nodes.map(serializeCanvasNode),
         edges: graph.edges,
@@ -326,10 +349,17 @@ async function saveDraft() {
       layout: { nodes: positions },
       base_graph_hash: currentGraphHash.value,
       pinned_dependency_revisions: [],
-    })
+    }
+    if (typeof window !== 'undefined' && !globalThis.navigator.onLine) {
+      await queueDraft({ workflowId, payload, queuedAt: Date.now() })
+      saveError.value = '网络已断开：草稿已安全保存在本机，恢复网络后将以 CAS 同步。'
+      return
+    }
+    const result = await apiPut<any>(`/workflows/${workflowId}/draft`, payload)
     currentGraphHash.value = result.graph_hash || ''
     draftVersion.value = result.draft_version || 0
   } catch (e: any) {
+    await queueDraft({ workflowId, payload: { graph: { nodes: nodes.value.map(serializeCanvasNode), edges: edges.value }, config: {}, layout: { nodes: Object.fromEntries(nodes.value.map((node) => [node.id, node.position])) }, base_graph_hash: currentGraphHash.value, pinned_dependency_revisions: [] }, queuedAt: Date.now() })
     saveError.value = e?.status === 409
       ? 'CAS 冲突：其他用户已修改此工作流，请刷新页面重试。'
       : e?.message ?? '保存失败'
@@ -382,6 +412,30 @@ async function loadArchitectProposal() {
   }
 }
 
+async function generateArchitectProposal() {
+  if (!workflowId || !architectIntent.value.trim() || architectGenerating.value) return
+  architectGenerating.value = true
+  architectError.value = ''
+  architectDiff.value = null
+  try {
+    const proposal: any = await apiPost('/architect/proposals', {
+      workflow_id: workflowId,
+      base_draft_hash: currentGraphHash.value,
+      intent: architectIntent.value.trim(),
+    })
+    if (proposal.state === 'unknown') {
+      architectError.value = 'Architect 请求正在等待 AtlasCloud 对账，请稍后刷新。'
+      return
+    }
+    architectProposalId.value = proposal.proposal_id
+    architectDiff.value = await apiGet(`/architect/proposals/${proposal.proposal_id}/diff`)
+  } catch (e: any) {
+    architectError.value = e?.message ?? 'Architect 提案生成失败'
+  } finally {
+    architectGenerating.value = false
+  }
+}
+
 async function applyArchitectProposal() {
   if (!architectDiff.value || architectApplying.value) return
   architectApplying.value = true
@@ -428,7 +482,7 @@ function deleteSelected() {
 </script>
 
 <template>
-  <div class="canvas-page">
+  <div class="canvas-page" data-testid="workflow-canvas" :aria-busy="loading">
     <div class="canvas-toolbar">
       <span class="canvas-title">工作流 {{ workflowId?.slice(0, 8) }}...</span>
       <span class="draft-info">v{{ draftVersion }} | hash: {{ currentGraphHash?.slice(0, 8) }}...</span>
@@ -438,8 +492,8 @@ function deleteSelected() {
         <button title="复制选中节点 (Ctrl/Cmd+C)" aria-label="复制选中节点" :disabled="selectedIds.length === 0 || !!registryError" @click="copySelection">⧉</button>
         <button title="粘贴节点 (Ctrl/Cmd+V)" aria-label="粘贴节点" :disabled="!clipboard || !!registryError" @click="pasteSelection">⌁</button>
         <button :disabled="saving || !workflowId || !!registryError" @click="saveDraft">{{ saving ? '保存中...' : '保存' }}</button>
-        <button @click="dryRun">dry-run</button>
-        <button @click="runCompile">编译</button>
+        <button data-testid="workflow-dry-run" @click="dryRun">dry-run</button>
+        <button data-testid="workflow-compile" @click="runCompile">编译</button>
         <button class="run-workflow-btn" :disabled="saving || !workflowId" @click="publishAndRun">发布并运行</button>
       </div>
     </div>
@@ -511,6 +565,7 @@ function deleteSelected() {
           <p v-if="selectedNode.data?.provider_required && selectedNode.data?.execution_available === false" class="provider-warn">
             此节点需要 AtlasCloud 凭证；当前环境尚未配置。
           </p>
+          <p v-if="selectedInspectorPlugin" class="hint">已加载专用编辑器：{{ selectedInspectorPlugin.component }}</p>
           <div v-for="(field, key) in selectedNode.data?.definition?.config_schema?.properties || {}" :key="String(key)" class="config-field">
             <label :for="`config-${key}`">{{ field.title || key }}</label>
             <select v-if="field.enum" :id="`config-${key}`" :value="configFieldValue(field, String(key))" :disabled="!!registryError || !!selectedNode.data?.unknown_definition" @change="updateSelectedConfig(String(key), ($event.target as HTMLSelectElement).value)">
@@ -525,8 +580,8 @@ function deleteSelected() {
         </div>
         <div v-else class="no-selection">选择节点</div>
 
-        <div v-if="compileResult" class="compile-panel">
-          <h4>{{ compileResult.status === 'compiled' ? '编译通过' : '编译诊断' }}</h4>
+        <div v-if="compileResult" class="compile-panel" data-testid="compile-result" role="status" aria-live="polite">
+          <h4>{{ compileResult.status === 'compiled' || compileResult.passes === true ? '编译通过' : '编译诊断' }}</h4>
           <div v-if="compileResult.diagnostics?.length">
             <div v-for="(d, i) in compileResult.diagnostics" :key="i" class="diag" :class="d.severity">
               {{ d.message }}
@@ -537,8 +592,9 @@ function deleteSelected() {
         <div class="architect-panel">
           <h4>Architect 提案</h4>
           <p>提案由受控 Agent 生成；确认前不会写入画布。</p>
-          <input v-model="architectProposalId" placeholder="WorkflowChangeProposal ID" aria-label="Architect proposal ID" />
-          <button @click="loadArchitectProposal">查看差异</button>
+          <textarea v-model="architectIntent" aria-label="Architect 创作意图" placeholder="描述想要调整的工作流" rows="3" />
+          <button :disabled="architectGenerating || !architectIntent.trim()" @click="generateArchitectProposal">{{ architectGenerating ? '正在生成...' : '生成提案' }}</button>
+          <details><summary>打开已有提案</summary><input v-model="architectProposalId" placeholder="WorkflowChangeProposal ID" aria-label="Architect proposal ID" /><button @click="loadArchitectProposal">查看差异</button></details>
           <p v-if="architectError" class="architect-error">{{ architectError }}</p>
           <template v-if="architectDiff">
             <p class="proposal-meta">基于 {{ architectDiff.base_draft_hash?.slice(0, 10) }} · {{ architectDiff.operations?.length || 0 }} 项操作</p>

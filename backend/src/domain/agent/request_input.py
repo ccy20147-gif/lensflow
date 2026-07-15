@@ -54,6 +54,21 @@ class AgentRequestInputService:
                 raise ValidationError_("RequestInput Agent owner_scope does not match run")
             if run.owner_scope != requester_scope:
                 raise ConflictError("Only the workflow owner may create Agent RequestInput")
+            # The revision, not the browser request, owns this interaction
+            # policy. Older revisions have a deliberately bounded compatible
+            # default so historical runs remain replayable.
+            policy = dict((revision.body or {}).get("request_input_policy") or {})
+            if policy and not policy.get("enabled", False):
+                raise ValidationError_("AgentRevision does not permit RequestInput")
+            allowed_refs = policy.get("allowed_schema_refs", [])
+            if allowed_refs and schema_ref not in allowed_refs:
+                raise ValidationError_("RequestInput schema_ref is not permitted by AgentRevision policy")
+            max_timeout = int(policy.get("max_timeout_minutes", 1_440))
+            if timeout_minutes > max_timeout:
+                raise ValidationError_("RequestInput timeout exceeds AgentRevision policy")
+            policy_response_max = int(policy.get("max_response_bytes", 16_384))
+            if max_response_bytes > policy_response_max:
+                raise ValidationError_("RequestInput response size exceeds AgentRevision policy")
             prior = s.query(HumanTaskModel).filter(
                 HumanTaskModel.attempt_id == attempt_id,
                 HumanTaskModel.task_kind == "request_input",

@@ -64,12 +64,6 @@ async function rejectTask(taskId: string) {
   catch (e: any) { error.value = e?.message ?? String(e) }
 }
 
-async function timeoutTask(taskId: string) {
-  const task = humanTasks.value.find((item) => item.task_id === taskId)
-  try { await apiPost(`/runtime/human-tasks/${taskId}/timeout`, { task_version: task?.task_version, idempotency_token: globalThis.crypto.randomUUID(), reason: 'User timeout' }); await loadHumanTasks() }
-  catch (e: any) { error.value = e?.message ?? String(e) }
-}
-
 async function resolveRequestInput(task: any) {
   const answer = { ...(requestAnswers.value[task.task_id] || {}) }
   const properties = task.timeout_policy?.input_schema?.properties || {}
@@ -188,7 +182,6 @@ function traceStepIds(steps: Array<{ step_id?: string }> | undefined): string {
             <template v-else>
             <button class="accept-btn" @click="resolveTask(t.task_id)">✓ 通过</button>
             <button class="reject-btn" @click="rejectTask(t.task_id)">✗ 拒绝</button>
-            <button class="timeout-btn" @click="timeoutTask(t.task_id)">⏱ 超时</button>
             </template>
           </div>
         </div>

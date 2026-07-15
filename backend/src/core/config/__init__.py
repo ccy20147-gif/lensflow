@@ -56,7 +56,13 @@ class Settings(BaseSettings):
     atlascloud_base_url: str = "https://api.atlascloud.ai"
     atlascloud_timeout_seconds: float = 45.0
     atlascloud_live_smoke_enabled: bool = False
+    # Public HTTPS endpoint registered with AtlasCloud for async media events.
+    # It is validated by the adapter before it can ever be sent upstream.
+    atlascloud_webhook_url: str = ""
     atlascloud_webhook_secret: str = ""
+    # Temporary migration escape hatch for the former AtlasCloud HMAC header.
+    # New installations must use the documented Ed25519/JWKS contract.
+    atlascloud_legacy_webhook_hmac_enabled: bool = False
     # Internal worker/control-plane credential. Public browser requests must
     # never be able to claim attempts, trigger recovery, or publish results.
     runtime_worker_key: str = ""
@@ -71,6 +77,11 @@ class Settings(BaseSettings):
     # Registry mutations are platform control-plane operations.  An empty
     # value deliberately disables every public mutation endpoint.
     registry_internal_admin_key: str = ""
+    registry_package_signing_key: str = ""
+    # Official workflow packages and benchmark seeding are platform
+    # maintainer operations. Empty deliberately means no public caller may
+    # create or seed an official template.
+    template_internal_admin_key: str = ""
     tool_execution_enabled: bool = False
 
 

@@ -211,6 +211,17 @@ class SqlSkillRepository:
                 raise NotFoundError("SkillRevision", str(revision_id))
             return row
 
+    def list_revisions(self, skill_id: UUID) -> list[SkillRevisionModel]:
+        """Return immutable revision history newest first, including retired rows."""
+        with self._factory() as session:
+            if session.get(SkillContentModel, skill_id) is None:
+                raise NotFoundError("SkillContent", str(skill_id))
+            return list(session.scalars(
+                select(SkillRevisionModel)
+                .where(SkillRevisionModel.skill_id == skill_id)
+                .order_by(SkillRevisionModel.revision_number.desc())
+            ))
+
     def retire_revision(self, revision_id: UUID) -> SkillRevisionModel:
         with self._factory.begin() as session:
             row = session.get(SkillRevisionModel, revision_id)

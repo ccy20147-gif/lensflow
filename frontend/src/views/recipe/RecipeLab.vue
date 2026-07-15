@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import {
+  apiGet,
   createRecipe,
   createRecipeRevision,
   diffRecipeRevisions,
   dryRunRecipe,
+  executeRecipeTrial,
   listRecipeRevisions,
   listRecipes,
   promoteRecipeRevision,
@@ -64,6 +66,9 @@ const operators = ref<OperatorRow[]>(defaultOperators())
 const validation = ref<{ valid: boolean; message?: string } | null>(null)
 const dryRun = ref<RecipeDryRunResult | null>(null)
 const diff = ref<MediaRecipeDiff | null>(null)
+const trialInputs = ref('{\n  "prompt": "Recipe Lab trial"\n}')
+const trialRunning = ref(false)
+const trialRun = ref<{ status: string; run_id: string; nodes: Array<Record<string, unknown>> } | null>(null)
 
 const revisionBody = computed<Record<string, unknown>>(() => ({
   recipe_type: recipeType.value,
@@ -129,6 +134,21 @@ async function validate() {
 }
 async function runDryRun() {
   try { dryRun.value = await dryRunRecipe(revisionBody.value); validation.value = { valid: true } } catch (caught) { validation.value = { valid: false, message: errorMessage(caught) }; dryRun.value = null }
+}
+async function runProviderTrial() {
+  if (!selectedRecipe.value || !selectedRevision.value || selectedRevision.value.revision_status !== 'active') {
+    error.value = '请先发布此 Recipe 修订，再执行 AtlasCloud 试跑。'
+    return
+  }
+  trialRunning.value = true; error.value = ''; trialRun.value = null
+  try {
+    const inputs = parseObject(trialInputs.value, '试跑输入')
+    const result = await executeRecipeTrial(selectedRecipe.value.recipe_id, selectedRevision.value.revision_id, {
+      inputs,
+      idempotency_key: `recipe-lab:${selectedRevision.value.revision_id}:${globalThis.crypto.randomUUID()}`,
+    })
+    trialRun.value = await apiGet<{ status: string; run_id: string; nodes: Array<Record<string, unknown>> }>(`/workflow-runs/${result.run_id}`)
+  } catch (caught) { error.value = errorMessage(caught) } finally { trialRunning.value = false }
 }
 async function saveRevision() {
   if (!selectedRecipe.value) return
@@ -197,11 +217,18 @@ async function showDiff(revision: MediaRecipeRevisionRecord) {
       <section class="versions"><h3>不可变修订</h3><div v-for="revision in revisions" :key="revision.revision_id" class="revision"><button type="button" class="revision-select" :class="{ selected: selectedRevision?.revision_id === revision.revision_id }" @click="loadRevision(revision)"><strong>r{{ revision.revision_number }}</strong><span>{{ revision.revision_status }}</span><code>{{ revision.content_hash.slice(0, 12) }}</code></button><div class="revision-actions"><button type="button" @click="showDiff(revision)" :disabled="selectedRevision?.revision_id === revision.revision_id">与当前比较</button><button v-if="selectedRevision?.revision_id === revision.revision_id && revision.revision_status === 'draft'" type="button" class="primary" @click="promote">发布</button><button v-if="selectedRevision?.revision_id === revision.revision_id && revision.revision_status === 'active'" type="button" @click="retire">退役</button></div></div>
         <pre v-if="diff" class="diff" aria-label="修订差异">{{ JSON.stringify(diff, null, 2) }}</pre>
       </section>
+      <section v-if="selectedRevision?.revision_status === 'active'" class="provider-trial" aria-label="AtlasCloud Recipe 试跑">
+        <h3>AtlasCloud 受控试跑</h3>
+        <p>使用当前已发布修订创建隔离运行，输入、provider dispatch、算子状态、产物和成本均持久化。</p>
+        <label>固定输入 JSON<textarea v-model="trialInputs" rows="4" spellcheck="false"></textarea></label>
+        <button type="button" class="primary" :disabled="trialRunning" @click="runProviderTrial">{{ trialRunning ? '正在提交 AtlasCloud...' : '执行受控试跑' }}</button>
+        <div v-if="trialRun" class="trace provider-trace"><strong>运行 {{ trialRun.status }}</strong><ul><li v-for="node in trialRun.nodes" :key="String(node.node_run_id)"><code>{{ node.node_instance_id }}</code> · {{ node.status }}<ul><li v-for="attempt in (node.attempts as Array<Record<string, unknown>>)" :key="String(attempt.attempt_id)">epoch {{ attempt.execution_epoch }} · {{ attempt.status }} · {{ attempt.provider_id || 'internal' }} · 成本 {{ attempt.actual_cost ?? '-' }} · 产物 {{ (attempt.output_artifact_version_ids as string[] || []).length }}</li></ul></li></ul></div>
+      </section>
     </section>
     <p class="provider-note">真实生成只经 AtlasCloud 服务端适配器；未配置凭证时在网络副作用前安全拒绝。</p>
   </main>
 </template>
 
 <style scoped>
-.recipe-page { max-width: 1180px; margin: 0 auto; padding: 24px; color: var(--text-primary); }.page-header h1,.page-header p { margin:0; }.page-header p,.hint,small,.empty { color:var(--text-secondary); }.page-header p { margin-top:6px; }.create-form,.actions { display:flex; gap:8px; flex-wrap:wrap; margin:20px 0; }.create-form input { flex:1; min-width:180px; }.create-form select { width:150px; }.recipe-list { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:18px; }.recipe-card,.revision-select { display:grid; text-align:left; gap:3px; min-width:150px; }.recipe-card.selected,.revision-select.selected { border-color:var(--accent); box-shadow:inset 3px 0 var(--accent); }.lab-editor { border:1px solid var(--border); background:var(--bg-secondary); padding:16px; border-radius:6px; }.editor-heading { display:flex; justify-content:space-between; gap:16px; align-items:start; }.editor-heading h2,.operator-section h3,.versions h3 { margin:0; }.editor-heading > span { color:var(--text-secondary); font-size:12px; }.contract-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:16px 0; }.contract-grid label,.operator-row label { display:grid; gap:4px; font-size:12px; color:var(--text-secondary); }.operator-section { border-top:1px solid var(--border); padding-top:14px; }.section-title { display:flex; justify-content:space-between; align-items:center; }.hint { font-size:12px; }.operator-row { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; align-items:end; border-top:1px solid var(--border); padding:12px 0; }.operator-params { grid-column:span 3; }.icon { min-width:34px; }.actions { margin-bottom:0; }.primary,.create-form button { background:var(--accent); color:#fff; }.result,.trace,.status,.error-banner { margin-top:12px; padding:9px; border-radius:4px; background:var(--bg-primary); }.error-banner { color:#b91c1c; background:#fef2f2; }.status { color:#166534; background:#f0fdf4; }.trace { display:grid; gap:6px; }.trace ul { margin:0; padding-left:18px; }.outcome-applied { color:#166534; }.outcome-degraded,.outcome-transformed,.outcome-ignored_with_warning { color:#a16207; }.outcome-blocked { color:#b91c1c; }.versions { border-top:1px solid var(--border); margin-top:16px; padding-top:14px; }.revision { display:flex; justify-content:space-between; gap:10px; padding:8px 0; border-bottom:1px solid var(--border); }.revision-select { border:0; padding:0; background:transparent; min-width:0; }.revision-actions { display:flex; align-items:center; gap:6px; }.diff { overflow:auto; max-height:380px; padding:10px; background:var(--bg-primary); font-size:11px; }.provider-note { font-size:12px; color:#b45309; margin-top:16px; } input,textarea,select,button { box-sizing:border-box; font:inherit; } input,textarea,select { width:100%; padding:7px; border:1px solid var(--border); border-radius:4px; background:var(--bg-primary); color:var(--text-primary); } button { padding:7px 10px; border:1px solid var(--border); border-radius:4px; background:var(--bg-primary); color:var(--text-primary); cursor:pointer; } button:disabled { opacity:.55; cursor:not-allowed; } @media (max-width:760px) { .contract-grid,.operator-row { grid-template-columns:1fr; }.operator-params { grid-column:auto; }.editor-heading,.revision { flex-direction:column; }.create-form select { width:100%; } }
+.recipe-page { max-width: 1180px; margin: 0 auto; padding: 24px; color: var(--text-primary); }.page-header h1,.page-header p { margin:0; }.page-header p,.hint,small,.empty { color:var(--text-secondary); }.page-header p { margin-top:6px; }.create-form,.actions { display:flex; gap:8px; flex-wrap:wrap; margin:20px 0; }.create-form input { flex:1; min-width:180px; }.create-form select { width:150px; }.recipe-list { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:18px; }.recipe-card,.revision-select { display:grid; text-align:left; gap:3px; min-width:150px; }.recipe-card.selected,.revision-select.selected { border-color:var(--accent); box-shadow:inset 3px 0 var(--accent); }.lab-editor { border:1px solid var(--border); background:var(--bg-secondary); padding:16px; border-radius:6px; }.editor-heading { display:flex; justify-content:space-between; gap:16px; align-items:start; }.editor-heading h2,.operator-section h3,.versions h3,.provider-trial h3 { margin:0; }.editor-heading > span { color:var(--text-secondary); font-size:12px; }.contract-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:16px 0; }.contract-grid label,.operator-row label,.provider-trial label { display:grid; gap:4px; font-size:12px; color:var(--text-secondary); }.operator-section { border-top:1px solid var(--border); padding-top:14px; }.section-title { display:flex; justify-content:space-between; align-items:center; }.hint { font-size:12px; }.operator-row { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; align-items:end; border-top:1px solid var(--border); padding:12px 0; }.operator-params { grid-column:span 3; }.icon { min-width:34px; }.actions { margin-bottom:0; }.primary,.create-form button { background:var(--accent); color:#fff; }.result,.trace,.status,.error-banner { margin-top:12px; padding:9px; border-radius:4px; background:var(--bg-primary); }.error-banner { color:#b91c1c; background:#fef2f2; }.status { color:#166534; background:#f0fdf4; }.trace { display:grid; gap:6px; }.trace ul { margin:0; padding-left:18px; }.outcome-applied { color:#166534; }.outcome-degraded,.outcome-transformed,.outcome-ignored_with_warning { color:#a16207; }.outcome-blocked { color:#b91c1c; }.versions,.provider-trial { border-top:1px solid var(--border); margin-top:16px; padding-top:14px; }.provider-trial { display:grid; gap:8px; }.provider-trial p { margin:0; color:var(--text-secondary); font-size:12px; }.revision { display:flex; justify-content:space-between; gap:10px; padding:8px 0; border-bottom:1px solid var(--border); }.revision-select { border:0; padding:0; background:transparent; min-width:0; }.revision-actions { display:flex; align-items:center; gap:6px; }.diff { overflow:auto; max-height:380px; padding:10px; background:var(--bg-primary); font-size:11px; }.provider-note { font-size:12px; color:#b45309; margin-top:16px; } input,textarea,select,button { box-sizing:border-box; font:inherit; } input,textarea,select { width:100%; padding:7px; border:1px solid var(--border); border-radius:4px; background:var(--bg-primary); color:var(--text-primary); } button { padding:7px 10px; border:1px solid var(--border); border-radius:4px; background:var(--bg-primary); color:var(--text-primary); cursor:pointer; } button:disabled { opacity:.55; cursor:not-allowed; } @media (max-width:760px) { .contract-grid,.operator-row { grid-template-columns:1fr; }.operator-params { grid-column:auto; }.editor-heading,.revision { flex-direction:column; }.create-form select { width:100%; } }
 </style>

@@ -1,24 +1,8 @@
 import { expect, test } from '@playwright/test'
+import { loginWithFreshAccount } from './auth'
 
 async function login(page: any) {
-  const email = `trial-${Date.now()}@toonflow.local`
-  await page.goto('/login')
-  await page.waitForSelector('.login-card')
-  const bootstrap = page.getByRole('button', { name: '初始化' })
-  if (await bootstrap.isVisible({ timeout: 1000 }).catch(() => false)) {
-    await page.fill('input[type="email"]', email)
-    await page.fill('input[type="text"]', 'Trial')
-    await page.fill('input[type="password"]', 'password')
-    await bootstrap.click()
-    await page.waitForTimeout(500)
-  }
-  await page.fill('input[type="email"]', email)
-  if (await page.locator('input[type="text"]').isVisible({ timeout: 500 }).catch(() => false)) await page.fill('input[type="text"]', 'Trial')
-  await page.fill('input[type="password"]', 'password')
-  const loginButton = page.getByRole('button', { name: '登录' })
-  if (await loginButton.isVisible({ timeout: 500 }).catch(() => false)) await loginButton.click()
-  else await page.locator('button[type="submit"]').click()
-  await page.waitForURL('**/projects')
+  await loginWithFreshAccount(page, 'trial', 'Trial')
 }
 
 test('Agent trial RequestInput survives refresh and accepts one typed answer', async ({ page }) => {
@@ -29,15 +13,33 @@ test('Agent trial RequestInput survives refresh and accepts one typed answer', a
   await page.locator('.create-form button[type="submit"]').click()
   const card = page.locator('.agent-card', { hasText: name })
   await card.click()
+  await expect(page.getByLabel('兼容 Skill 修订')).toBeVisible()
+  await expect(page.getByLabel('已批准 Tool 修订')).toBeVisible()
   await page.fill('.step label:nth-child(2) input', 'Return typed text')
+  await page.fill('.step label:nth-child(3) input', 'workflow.brief')
+  await page.fill('.step label:nth-child(4) input', 'artifact.text')
+  await page.locator('.step label:nth-child(6) select').selectOption('retry')
+  await page.getByLabel('允许补问').check()
+  await page.getByLabel('允许 schema refs').fill('choice.v1')
+  await page.getByRole('button', { name: '静态校验' }).click()
+  await expect(page.locator('.result').first()).toContainText('通过')
   await page.getByRole('button', { name: '隔离试跑' }).click()
   await expect(page.locator('.trial')).toBeVisible()
+  await expect(page.locator('.trial-timeline')).toContainText('started')
   await page.getByRole('button', { name: '创建补问' }).click()
   await expect(page.locator('.trial')).toContainText('waiting')
   await page.reload()
-  await page.locator('.agent-card', { hasText: name }).click()
+  await page.getByRole('button', { name: `${name} configurable`, exact: true }).click()
+  await expect(page.locator('.step label:nth-child(3) input')).toHaveValue('workflow.brief')
+  await expect(page.locator('.step label:nth-child(4) input')).toHaveValue('artifact.text')
+  await expect(page.locator('.step label:nth-child(6) select')).toHaveValue('retry')
+  await page.getByRole('button', { name: '提交不可变修订' }).click()
+  await expect(page.locator('.revisions')).toContainText('r1')
   await expect(page.locator('.trial')).toContainText('waiting')
   await page.locator('input[aria-label="Trial answer JSON"]').fill('{"choice":"yes"}')
   await page.getByRole('button', { name: '提交回答' }).click()
   await expect(page.locator('.trial')).toContainText('accepted')
+  await page.getByLabel('Clone Agent name').fill(`${name} copy`)
+  await page.getByRole('button', { name: '克隆并重新绑定' }).click()
+  await expect(page.locator('.clone-result')).toContainText('无 Tool 凭证需要重新绑定')
 })

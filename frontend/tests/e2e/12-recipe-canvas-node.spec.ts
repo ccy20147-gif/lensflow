@@ -1,18 +1,8 @@
 import { expect, test } from '@playwright/test'
+import { loginWithFreshAccount } from './auth'
 
 async function login(page: import('@playwright/test').Page) {
-  await page.goto('/login')
-  const email = `recipe-canvas-${Date.now()}-${Math.random().toString(36).slice(2, 6)}@toonflow.local`
-  const bootstrap = page.getByRole('button', { name: '初始化' })
-  if (await bootstrap.isVisible({ timeout: 2_000 }).catch(() => false)) {
-    await page.fill('input[type="email"]', email); await page.fill('input[type="text"]', 'Recipe Canvas'); await page.fill('input[type="password"]', 'password'); await bootstrap.click()
-  }
-  await page.fill('input[type="email"]', email)
-  if (await page.locator('input[type="text"]').isVisible({ timeout: 1_000 }).catch(() => false)) await page.fill('input[type="text"]', 'Recipe Canvas')
-  await page.fill('input[type="password"]', 'password')
-  const signIn = page.getByRole('button', { name: '登录' })
-  if (await signIn.isVisible({ timeout: 2_000 }).catch(() => false)) await signIn.click(); else await page.locator('button[type="submit"]').click()
-  await page.waitForURL('**/projects')
+  await loginWithFreshAccount(page, 'recipe-canvas', 'Recipe Canvas')
 }
 
 test('published internal Recipe appears as one canvas node and starts a workflow run', async ({ page }) => {

@@ -1,25 +1,8 @@
 import { expect, test } from '@playwright/test'
+import { loginWithFreshAccount } from './auth'
 
 async function login(page: import('@playwright/test').Page) {
-  await page.goto('/login')
-  await page.waitForSelector('.login-card')
-  const email = `recipe-revision-${Date.now()}-${Math.random().toString(36).slice(2, 6)}@toonflow.local`
-  const bootstrap = page.getByRole('button', { name: '初始化' })
-  if (await bootstrap.isVisible({ timeout: 2_000 }).catch(() => false)) {
-    await page.fill('input[type="email"]', email)
-    await page.fill('input[type="text"]', 'Recipe Revision')
-    await page.fill('input[type="password"]', 'password')
-    await bootstrap.click()
-  }
-  await page.fill('input[type="email"]', email)
-  if (await page.locator('input[type="text"]').isVisible({ timeout: 1_000 }).catch(() => false)) {
-    await page.fill('input[type="text"]', 'Recipe Revision')
-  }
-  await page.fill('input[type="password"]', 'password')
-  const signIn = page.getByRole('button', { name: '登录' })
-  if (await signIn.isVisible({ timeout: 2_000 }).catch(() => false)) await signIn.click()
-  else await page.locator('button[type="submit"]').click()
-  await page.waitForURL('**/projects')
+  await loginWithFreshAccount(page, 'recipe-revision', 'Recipe Revision')
 }
 
 test('Recipe Lab persists a CAS revision, promotes it, and displays an A/B diff', async ({ page }) => {
@@ -42,6 +25,18 @@ test('Recipe Lab persists a CAS revision, promotes it, and displays an A/B diff'
   await expect(page.locator('.versions')).toContainText('draft')
   await page.getByRole('button', { name: '发布', exact: true }).click()
   await expect(page.locator('.versions')).toContainText('active')
+
+  // The Lab must exercise the production-shaped, revision-pinned trial
+  // endpoint rather than treating compile-only dry-run as an execution. This
+  // credentialless E2E environment intentionally proves the safe provider
+  // rejection path; a configured deployment continues through AtlasCloud.
+  await expect(page.getByRole('button', { name: '执行受控试跑', exact: true })).toBeVisible()
+  const trialResponse = page.waitForResponse((response) =>
+    response.url().includes('/api/v1/recipes/') && response.url().includes('/trial') && response.request().method() === 'POST',
+  )
+  await page.getByRole('button', { name: '执行受控试跑', exact: true }).click()
+  expect((await trialResponse).status()).toBe(403)
+  await expect(page.locator('.error-banner')).toContainText('POST /api/v1/recipes/')
 
   // Change the public parameter contract, creating revision B with r1's
   // content hash as the CAS base hash. The Lab must not mutate r1.

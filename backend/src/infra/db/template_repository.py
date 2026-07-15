@@ -9,6 +9,8 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
+import hashlib
+import json
 import re
 from uuid import UUID, uuid4
 
@@ -63,7 +65,10 @@ BENCHMARK_TEMPLATE_GRAPHS: dict[str, dict[str, Any]] = {
             {"id": "review", "type": "review", "config": {"issues": []}},
             {"id": "export", "type": "package_export", "config": {"artifact_version_ids": []}},
         ],
-        "edges": [{"source": a, "target": b} for a, b in [("brief", "constraints"), ("constraints", "generate"), ("generate", "variants"), ("variants", "select"), ("select", "retouch"), ("retouch", "review"), ("review", "export")]],
+        "edges": [
+            {"source": source, "sourceHandle": "out", "target": target, "targetHandle": "in"}
+            for source, target in [("brief", "constraints"), ("constraints", "generate"), ("generate", "variants"), ("variants", "select"), ("select", "retouch"), ("retouch", "review"), ("review", "export")]
+        ],
     },
     "镜头计划与分镜提交": {
         "nodes": [
@@ -77,8 +82,30 @@ BENCHMARK_TEMPLATE_GRAPHS: dict[str, dict[str, Any]] = {
             {"id": "review", "type": "review", "config": {"issues": []}},
             {"id": "export", "type": "package_export", "config": {"artifact_version_ids": []}},
         ],
-        "edges": [{"source": a, "target": b} for a, b in [("brief", "constraints"), ("constraints", "shot_plan"), ("shot_plan", "router"), ("router", "variants"), ("variants", "select"), ("select", "storyboard"), ("storyboard", "review"), ("review", "export")]],
+        "edges": [
+            {"source": source, "sourceHandle": "out", "target": target, "targetHandle": "in"}
+            for source, target in [("brief", "constraints"), ("constraints", "shot_plan"), ("shot_plan", "router"), ("router", "variants"), ("variants", "select"), ("select", "storyboard"), ("storyboard", "review"), ("review", "export")]
+        ],
     },
+}
+
+
+def _benchmark_content_hash(graph: dict[str, Any]) -> str:
+    """Return the stable, semantic version of an official benchmark graph.
+
+    Benchmark packages are immutable pins to a WorkflowRevision.  A package
+    name alone therefore cannot tell whether a prior seed is still current:
+    historically it allowed an untyped-edge revision to be reused forever.
+    Keep the version derived from canonical graph content rather than from an
+    incidental database ID or deployment time.
+    """
+    encoded = json.dumps(graph, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+BENCHMARK_TEMPLATE_CONTENT_HASHES: dict[str, str] = {
+    name: _benchmark_content_hash(graph)
+    for name, graph in BENCHMARK_TEMPLATE_GRAPHS.items()
 }
 
 
@@ -149,7 +176,13 @@ class SqlTemplateService(TemplateService):
         self._factory = factory or get_session_factory()
 
     def seed_benchmark_templates(self, owner_scope: OwnerScope) -> list[str]:
-        """Create the two official public-node benchmark packages once per owner."""
+        """Upsert the current immutable official benchmark packages per owner.
+
+        An older package is deliberately *retired*, not overwritten, when its
+        pinned revision no longer matches the canonical benchmark graph.  This
+        preserves provenance for existing instances while ensuring the public
+        gallery can only instantiate the current typed-edge graph.
+        """
         from src.domain.workflow.sql_workflow_service import SqlWorkflowService
         from src.domain.workflow.builtin_registry import ensure_public_business_node_baseline
 
@@ -160,16 +193,59 @@ class SqlTemplateService(TemplateService):
         for name, graph in BENCHMARK_TEMPLATE_GRAPHS.items():
             if any(str(node.get("type")) not in allowed for node in graph["nodes"]):
                 raise ValidationError_("Benchmark template contains a non-public node")
+            content_hash = BENCHMARK_TEMPLATE_CONTENT_HASHES[name]
+            manifest_version = f"benchmark-{content_hash}"
             with self._factory() as session:
-                existing = session.scalar(select(WorkflowTemplateModel.template_id).where(WorkflowTemplateModel.owner_scope == owner_scope.scoped_id, WorkflowTemplateModel.name == name))
-            if existing is not None:
-                created.append(str(existing))
+                rows = session.execute(
+                    select(WorkflowTemplateModel, WorkflowRevisionModel)
+                    .join(WorkflowRevisionModel, WorkflowTemplateModel.workflow_revision_id == WorkflowRevisionModel.revision_id)
+                    .where(
+                        WorkflowTemplateModel.owner_scope == owner_scope.scoped_id,
+                        WorkflowTemplateModel.name == name,
+                        WorkflowTemplateModel.revision_status == RevisionStatus.ACTIVE,
+                    )
+                    .order_by(WorkflowTemplateModel.created_at.desc())
+                ).all()
+            current = next(
+                (
+                    template
+                    for template, revision in rows
+                    if revision.graph_hash == compute_draft_hashes(graph, {}, {})[0]
+                    and str((template.manifest or {}).get("version", "")) == manifest_version
+                ),
+                None,
+            )
+            if current is not None:
+                created.append(str(current.template_id))
                 continue
+
+            # Source revisions and packages are immutable.  Retire every
+            # stale active package with this official name before publishing
+            # the replacement so list/instantiate cannot select old content.
+            if rows:
+                with self._factory.begin() as session:
+                    stale_ids = [template.template_id for template, _ in rows]
+                    stale_rows = session.scalars(
+                        select(WorkflowTemplateModel)
+                        .where(WorkflowTemplateModel.template_id.in_(stale_ids))
+                        .with_for_update()
+                    ).all()
+                    now = datetime.now(timezone.utc)
+                    for stale in stale_rows:
+                        stale.revision_status = RevisionStatus.RETIRED
+                        stale.updated_at = now
             workflow = workflows.create_workflow(owner_scope=owner_scope)
             draft = workflows.get_draft(workflow.workflow_id)
             workflows.save_draft(workflow.workflow_id, graph, {}, {}, draft.graph_hash)
             revision = workflows.create_revision_from_draft(workflow.workflow_id, uuid4())
-            created.append(self.create_template(name, str(revision.revision_id), description="官方专业基准流程，仅使用公共业务节点与 workflow-owned WorkbenchTask", visibility="public", owner_scope=owner_scope))
+            created.append(self.create_template(
+                name,
+                str(revision.revision_id),
+                manifest=WorkflowPackageManifest(name=name, version=manifest_version),
+                description="官方专业基准流程，仅使用公共业务节点与 workflow-owned WorkbenchTask",
+                visibility="public",
+                owner_scope=owner_scope,
+            ))
         return created
 
     def create_template(
@@ -370,6 +446,164 @@ class SqlTemplateService(TemplateService):
         if not ok:
             return False, self._diagnostic(dep, "ENTITLEMENT_DENIED", "Dependency is unavailable or not owned by this owner", path=path)
         return True, None
+
+    def resolve_import_manifest(
+        self,
+        manifest: WorkflowPackageManifest,
+        *,
+        replacements: dict[str, str] | None,
+        owner_scope: OwnerScope,
+    ) -> dict[str, Any]:
+        """Resolve an untrusted package before it is allowed into a Draft.
+
+        This deliberately shares the durable dependency/entitlement checks
+        used by template instantiation, but does not create a Template or a
+        Revision.  An imported package is still untrusted after this check;
+        the result only proves that its declared dependency closure is
+        currently selectable by the importing owner.
+        """
+        errors = self.validate_manifest(manifest)
+        if errors:
+            raise ValidationError_("WorkflowPackageManifest is invalid", details={"errors": errors})
+        if manifest.version != "1.0.0":
+            raise ValidationError_(
+                "Unsupported WorkflowPackageManifest version",
+                details={"diagnostics": [{"code": "UNSUPPORTED_PACKAGE_VERSION", "version": manifest.version}]},
+            )
+        raw = manifest.to_dict()
+        replacements = replacements or {}
+        if _contains_forbidden(raw) or _contains_forbidden(replacements):
+            raise PolicyBlockedError("导入包不得包含 secret 或 CredentialBinding")
+
+        slot_by_id = {slot.slot_id: slot for slot in manifest.replacement_slots}
+        missing: list[str] = []
+        unresolved_slots: list[str] = []
+        resolution: dict[str, str] = {}
+        diagnostics: list[dict[str, Any]] = []
+        closure: list[dict[str, Any]] = []
+        with self._factory() as session:
+            for dep in manifest.dependencies:
+                path = ["import", dep.dep_id]
+                if dep.replacement_slot:
+                    slot = slot_by_id.get(dep.replacement_slot)
+                    replacement = replacements.get(dep.replacement_slot)
+                    if slot is None:
+                        missing.append(dep.dep_id)
+                        diagnostics.append(self._diagnostic(dep, "INVALID_SLOT", "Dependency names a missing replacement slot", path=path))
+                    elif not replacement and slot.required:
+                        unresolved_slots.append(slot.slot_id)
+                        diagnostics.append(self._diagnostic(dep, "REPLACEMENT_REQUIRED", f"Replacement slot {slot.slot_id} is required", path=path))
+                    elif replacement:
+                        valid, diagnostic = self._resolve_replacement(
+                            session=session, dep=dep, slot=slot, value=replacement,
+                            owner_scope=owner_scope, path=path,
+                        )
+                        if valid:
+                            resolution[dep.dep_id] = replacement
+                            closure.append({"path": path, "dep_id": dep.dep_id, "kind": slot.expected_kind.value, "revision_id": replacement, "source": "replacement"})
+                        else:
+                            missing.append(dep.dep_id)
+                            assert diagnostic is not None
+                            diagnostics.append(diagnostic)
+                    continue
+                if dep.kind == DependencyKind.TEMPLATE:
+                    nested = self._resolve_import_template_dependency(session, dep, owner_scope, path, set(), replacements)
+                    closure.extend(nested["closure"])
+                    if not nested["resolved"]:
+                        missing.append(dep.dep_id)
+                        diagnostics.extend(nested["diagnostics"])
+                    else:
+                        resolution[dep.dep_id] = dep.revision_id
+                        closure.append({"path": path, "dep_id": dep.dep_id, "kind": dep.kind.value, "revision_id": dep.revision_id, "source": "nested_template"})
+                    continue
+                valid, diagnostic = self._resolve_direct_dependency(session, dep, owner_scope, path)
+                if valid:
+                    # Import packages may select only the platform's provider
+                    # namespace.  Older local templates retain their legacy
+                    # compatibility rule; this is an external-input boundary.
+                    if dep.kind == DependencyKind.PROVIDER and not dep.revision_id.startswith("atlascloud/"):
+                        valid = False
+                        diagnostic = self._diagnostic(dep, "UNSUPPORTED_PROVIDER", "Imported packages must use an AtlasCloud provider reference", path=path)
+                if valid:
+                    resolution[dep.dep_id] = dep.revision_id
+                    closure.append({"path": path, "dep_id": dep.dep_id, "kind": dep.kind.value, "revision_id": dep.revision_id, "source": "manifest"})
+                else:
+                    missing.append(dep.dep_id)
+                    assert diagnostic is not None
+                    diagnostics.append(diagnostic)
+        return {
+            "resolved": not missing and not unresolved_slots,
+            "missing": list(dict.fromkeys(missing)),
+            "unresolved_slots": list(dict.fromkeys(unresolved_slots)),
+            "available": not missing,
+            "resolution": resolution,
+            "diagnostics": diagnostics,
+            "closure": closure,
+        }
+
+    def _resolve_import_template_dependency(
+        self, session: Session, dep: PackageDependency, owner_scope: OwnerScope, path: list[str], seen: set[str],
+        replacements: dict[str, str],
+    ) -> dict[str, Any]:
+        """Resolve nested template closure without hiding private/missing IDs."""
+        template_uuid = self._uuid_or_diagnostic(dep.revision_id)
+        if template_uuid is None:
+            return {"resolved": False, "diagnostics": [self._diagnostic(dep, "INVALID_UUID", "Template dependency id must be a UUID", path=path)], "closure": []}
+        key = str(template_uuid)
+        if key in seen:
+            return {"resolved": False, "diagnostics": [self._diagnostic(dep, "TEMPLATE_CYCLE", "Template dependency cycle detected", path=[*path, key])], "closure": []}
+        row = session.get(WorkflowTemplateModel, template_uuid)
+        if row is None:
+            return {"resolved": False, "diagnostics": [self._diagnostic(dep, "MISSING_DEPENDENCY", "Nested template does not exist", path=path)], "closure": []}
+        if row.visibility != "public" and row.owner_scope != owner_scope.scoped_id:
+            return {"resolved": False, "diagnostics": [self._diagnostic(dep, "ENTITLEMENT_DENIED", "Nested template is private or unavailable", path=path)], "closure": []}
+        if row.revision_status != RevisionStatus.ACTIVE:
+            return {"resolved": False, "diagnostics": [self._diagnostic(dep, "MISSING_DEPENDENCY", "Nested template revision is unavailable", path=path)], "closure": []}
+        next_seen = {*seen, key}
+        closure: list[dict[str, Any]] = []
+        diagnostics: list[dict[str, Any]] = []
+        nested_manifest = _manifest_from_json(row.manifest or {})
+        if _contains_forbidden(row.manifest or {}):
+            return {"resolved": False, "diagnostics": [self._diagnostic(dep, "PACKAGE_FORBIDDEN_CONTENT", "Nested template contains forbidden package content", path=path)], "closure": []}
+        errors = self.validate_manifest(nested_manifest)
+        if errors:
+            return {"resolved": False, "diagnostics": [self._diagnostic(dep, "INVALID_MANIFEST", "Nested template manifest is invalid", path=path)], "closure": []}
+        slots = {slot.slot_id: slot for slot in nested_manifest.replacement_slots}
+        for nested_dep in nested_manifest.dependencies:
+            nested_path = [*path, key, nested_dep.dep_id]
+            if nested_dep.replacement_slot:
+                slot = slots.get(nested_dep.replacement_slot)
+                replacement = replacements.get(nested_dep.replacement_slot)
+                if slot is None:
+                    diagnostics.append(self._diagnostic(nested_dep, "INVALID_SLOT", "Dependency names a missing replacement slot", path=nested_path))
+                elif not replacement and slot.required:
+                    diagnostics.append(self._diagnostic(nested_dep, "REPLACEMENT_REQUIRED", f"Replacement slot {slot.slot_id} is required", path=nested_path))
+                elif replacement:
+                    valid, diagnostic = self._resolve_replacement(
+                        session=session, dep=nested_dep, slot=slot, value=replacement,
+                        owner_scope=owner_scope, path=nested_path,
+                    )
+                    if valid:
+                        closure.append({"path": nested_path, "dep_id": nested_dep.dep_id, "kind": slot.expected_kind.value, "revision_id": replacement, "source": "replacement"})
+                    else:
+                        assert diagnostic is not None
+                        diagnostics.append(diagnostic)
+                continue
+            if nested_dep.kind == DependencyKind.TEMPLATE:
+                result = self._resolve_import_template_dependency(session, nested_dep, owner_scope, nested_path, next_seen, replacements)
+                closure.extend(result["closure"])
+                diagnostics.extend(result["diagnostics"])
+            else:
+                valid, diagnostic = self._resolve_direct_dependency(session, nested_dep, owner_scope, nested_path)
+                if valid and nested_dep.kind == DependencyKind.PROVIDER and not nested_dep.revision_id.startswith("atlascloud/"):
+                    valid = False
+                    diagnostic = self._diagnostic(nested_dep, "UNSUPPORTED_PROVIDER", "Imported packages must use an AtlasCloud provider reference", path=nested_path)
+                if valid:
+                    closure.append({"path": nested_path, "dep_id": nested_dep.dep_id, "kind": nested_dep.kind.value, "revision_id": nested_dep.revision_id, "source": "nested_manifest"})
+                else:
+                    assert diagnostic is not None
+                    diagnostics.append(diagnostic)
+        return {"resolved": not diagnostics, "diagnostics": diagnostics, "closure": closure}
 
     def resolve_dependencies(self, template_id: str, replacements: dict[str, str] | None = None, owner_scope: OwnerScope | None = None, _seen: set[str] | None = None, _path: list[str] | None = None) -> dict[str, Any]:
         """Resolve every package dependency against the current durable state.

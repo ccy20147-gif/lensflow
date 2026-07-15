@@ -69,6 +69,11 @@ class AssembleSkillsRequest(BaseModel):
 
 class SkillDryRunResponse(BaseModel):
     valid: bool
+    resolved_sections: list[dict] = []
+    token_accounting: dict[str, int] = {}
+    conflicts: list[str] = []
+    security_decisions: list[str] = []
+    final_context_hash: str = ""
 
 class SkillPolicyRequest(BaseModel):
     reason: str = ""
@@ -88,6 +93,18 @@ def _skill_orm_to_dict(row) -> dict:
         "status": row.status,
         "created_at": row.created_at.isoformat() if row.created_at else "",
         "updated_at": row.updated_at.isoformat() if row.updated_at else "",
+    }
+
+
+def _skill_revision_to_dict(row) -> dict:
+    return {
+        "revision_id": str(row.revision_id),
+        "skill_id": str(row.skill_id),
+        "revision_number": row.revision_number,
+        "body": row.body,
+        "content_hash": row.content_hash,
+        "status": row.status,
+        "created_at": row.created_at.isoformat() if row.created_at else "",
     }
 
 
@@ -199,7 +216,30 @@ async def submit_skill_revision(skill_id: UUID, body: SubmitSkillRevisionRequest
         row = _skill._repo.submit_revision(skill_id, base_hash=body.base_hash)
     except (NotFoundError, ConflictError, ForbiddenError) as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.to_dict())
-    return {"revision_id": str(row.revision_id), "skill_id": str(row.skill_id), "revision_number": row.revision_number, "content_hash": row.content_hash, "status": row.status}
+    return _skill_revision_to_dict(row)
+
+
+@router.get("/{skill_id}/revisions")
+async def list_skill_revisions(skill_id: UUID, authorization: str | None = Header(None)) -> list[dict]:
+    """List immutable revision history for an owned Skill."""
+    try:
+        _require_skill_owner(skill_id, authorization)
+        return [_skill_revision_to_dict(row) for row in _skill._repo.list_revisions(skill_id)]
+    except (NotFoundError, ForbiddenError) as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.to_dict())
+
+
+@router.post("/{skill_id}/revisions/{revision_id}/retire")
+async def retire_skill_revision(skill_id: UUID, revision_id: UUID, authorization: str | None = Header(None)) -> dict:
+    """Retire a frozen revision while retaining it for audit and old runs."""
+    try:
+        _require_skill_owner(skill_id, authorization)
+        revision = _skill._repo.get_revision(revision_id)
+        if revision.skill_id != skill_id:
+            raise NotFoundError("SkillRevision", str(revision_id))
+        return _skill_revision_to_dict(_skill._repo.retire_revision(revision_id))
+    except (NotFoundError, ForbiddenError) as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.to_dict())
 
 
 @router.post("/{skill_id}/retire")
@@ -313,8 +353,10 @@ async def validate_skill_body(body: SkillValidateRequest) -> dict:
 @router.post("/dry-run")
 async def dry_run_skill(body: SkillDryRunRequest) -> SkillDryRunResponse:
     """Validate and return structural info without persisting."""
-    result = _skill.dry_run(body.body)
-    return SkillDryRunResponse(valid=result["valid"])
+    try:
+        return SkillDryRunResponse(**_skill.dry_run(body.body))
+    except ValidationError_ as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.to_dict())
 
 
 @router.post("/assemble", response_model=SkillAssemblyPlan)

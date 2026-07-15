@@ -1,24 +1,8 @@
 import { expect, test } from '@playwright/test'
+import { loginWithFreshAccount } from './auth'
 
 async function login(page: any) {
-  const email = `agent-trace-${Date.now()}@toonflow.local`
-  await page.goto('/login')
-  const bootstrap = page.getByRole('button', { name: '初始化' })
-  if (await bootstrap.isVisible({ timeout: 1_000 }).catch(() => false)) {
-    await page.fill('input[type="email"]', email); await page.fill('input[type="text"]', 'Agent Trace'); await page.fill('input[type="password"]', 'password'); await bootstrap.click()
-    await page.getByRole('button', { name: '登录' }).waitFor()
-    await page.fill('input[type="email"]', email); await page.fill('input[type="password"]', 'password'); await page.getByRole('button', { name: '登录' }).click()
-    await page.waitForURL('**/projects')
-    return
-  }
-  await page.getByRole('button', { name: '登录' }).waitFor()
-  await page.getByRole('link', { name: '注册' }).click()
-  await page.fill('input[type="email"]', email); await page.fill('input[type="text"]', 'Agent Trace'); await page.fill('input[type="password"]', 'password')
-  await page.getByRole('button', { name: '注册' }).click()
-  await page.getByRole('link', { name: '登录' }).waitFor()
-  await page.getByRole('link', { name: '登录' }).click()
-  await page.fill('input[type="email"]', email); await page.fill('input[type="password"]', 'password'); await page.getByRole('button', { name: '登录' }).click()
-  await page.waitForURL('**/projects')
+  await loginWithFreshAccount(page, 'agent-trace', 'Agent Trace')
 }
 
 test('Workbench renders owner Agent trace and RequestInput recovery after refresh', async ({ page }) => {

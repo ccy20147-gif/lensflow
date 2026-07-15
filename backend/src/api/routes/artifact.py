@@ -68,6 +68,10 @@ class ArtifactVersionRequest(BaseModel):
     content_hash: str = ""
 
 
+class BlobMutationRequest(BaseModel):
+    blob_uri: str
+
+
 class CreateResourceRequest(BaseModel):
     resource_type: str
     content_artifact_version_id: UUID
@@ -205,6 +209,17 @@ async def find_stale_downstream(
     return [str(v) for v in _artifact.stale_downstream(upstream_artifact_id, owner_scope)]
 
 
+@router.post("/blobs/delete-check")
+async def check_blob_delete(body: BlobMutationRequest, authorization: str | None = Header(None)) -> dict[str, bool]:
+    """Control-plane guard for destructive blob lifecycle operations."""
+    owner = _resolve_owner(authorization)
+    try:
+        _artifact.assert_blob_mutation_allowed(body.blob_uri, owner)
+    except ValidationError_ as exc:
+        raise HTTPException(status_code=409, detail=exc.to_dict()) from exc
+    return {"allowed": True}
+
+
 # ------------------------------------------------------------------
 # ArtifactRef resolution (cross-owner check)
 # ------------------------------------------------------------------
@@ -297,6 +312,28 @@ async def resource_provenance(resource_id: UUID, authorization: str | None = Hea
     owner = _resolve_owner(authorization)
     try:
         return _resources.provenance(resource_id, owner)
+    except (NotFoundError, CrossOwnerError) as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
+
+
+@router.get("/resources/{resource_id}/revisions/{revision_id}/diff/{other_revision_id}")
+async def diff_resource_revisions(resource_id: UUID, revision_id: UUID, other_revision_id: UUID,
+                                  authorization: str | None = Header(None)) -> dict[str, Any]:
+    """Owner-scoped immutable revision comparison for the workbench CAS UI."""
+    owner = _resolve_owner(authorization)
+    try:
+        revisions = {item.revision_id: item for item in _resources.list_revisions(resource_id, owner)}
+        left, right = revisions.get(revision_id), revisions.get(other_revision_id)
+        if left is None or right is None:
+            raise NotFoundError("ResourceRevision", str(revision_id if left is None else other_revision_id))
+        left_artifact = _artifact.get_version(left.content_artifact_version_id, owner)
+        right_artifact = _artifact.get_version(right.content_artifact_version_id, owner)
+        left_content, right_content = left_artifact.content_json or {}, right_artifact.content_json or {}
+        keys = sorted(set(left_content) | set(right_content)) if isinstance(left_content, dict) and isinstance(right_content, dict) else []
+        return {"resource_id": str(resource_id), "from_revision_id": str(revision_id), "to_revision_id": str(other_revision_id),
+                "from_artifact_version_id": str(left.content_artifact_version_id), "to_artifact_version_id": str(right.content_artifact_version_id),
+                "changed_keys": [key for key in keys if left_content.get(key) != right_content.get(key)],
+                "content_changed": left_content != right_content}
     except (NotFoundError, CrossOwnerError) as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc
 

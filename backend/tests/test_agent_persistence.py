@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
@@ -20,7 +22,8 @@ from sqlalchemy import text
 from src.core.exceptions import ConflictError, NotFoundError, ValidationError_
 from src.infra.db.agent_repository import SqlAgentRepository, SqlAgentService
 from src.infra.db.models import (
-    AgentTrialRunModel, AgentTrialStepTraceModel, ResourceDraftModel, ResourceModel, ResourceRevisionModel, SkillContentModel,
+    AgentDraftModel, AgentRevisionModel, AgentTrialRunModel, AgentTrialStepTraceModel, ArtifactVersionModel, OutboxEventModel,
+    ResourceDraftModel, ResourceModel, ResourceRevisionModel, SkillContentModel,
     SkillRevisionModel, ToolDefinitionModel, ToolRevisionModel, WorkflowModel,
     WorkflowRevisionModel, WorkflowRunModel, NodeRunModel, NodeRunAttemptModel,
 )
@@ -121,6 +124,87 @@ class TestAgentRevision:
         with pytest.raises(ConflictError):
             repo.submit_draft(sample_agent.agent_id, base_draft_version=saved.draft_version)
 
+    def test_submit_draft_conflict_has_current_server_recovery_data(self, repo, sample_agent):
+        initial = repo.get_draft(sample_agent.agent_id)
+        saved = repo.save_draft(sample_agent.agent_id, body={
+            "sop_steps": [{"step_id": "saved", "instruction": "submit"}],
+            "execution_policy": {"provider_ref": "atlascloud/test"},
+        }, base_draft_version=initial.draft_version)
+        with pytest.raises(ConflictError) as raised:
+            repo.submit_draft(sample_agent.agent_id, base_draft_version=saved.draft_version - 1)
+        assert raised.value.details == {
+            "current_draft_version": saved.draft_version,
+            "current_content_hash": saved.content_hash,
+            "base_revision_id": None,
+        }
+
+    def test_submit_draft_concurrent_cas_creates_one_complete_revision(self, repo, sample_agent, pg_factory):
+        initial = repo.get_draft(sample_agent.agent_id)
+        saved = repo.save_draft(sample_agent.agent_id, body={
+            "sop_steps": [{"step_id": "concurrent", "instruction": "freeze once"}],
+            "execution_policy": {"provider_ref": "atlascloud/test"},
+        }, base_draft_version=initial.draft_version)
+        barrier = threading.Barrier(2)
+
+        def submit_once():
+            barrier.wait(timeout=5)
+            try:
+                return ("success", repo.submit_draft(sample_agent.agent_id, base_draft_version=saved.draft_version))
+            except ConflictError as exc:
+                return ("conflict", exc)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = [future.result(timeout=15) for future in (pool.submit(submit_once), pool.submit(submit_once))]
+        assert [kind for kind, _ in outcomes].count("success") == 1
+        conflicts = [value for kind, value in outcomes if kind == "conflict"]
+        assert len(conflicts) == 1
+        assert conflicts[0].details["current_draft_version"] == saved.draft_version + 1
+        with pg_factory() as session:
+            revisions = list(session.query(AgentRevisionModel).filter(AgentRevisionModel.agent_id == sample_agent.agent_id))
+            artifacts = list(session.query(ArtifactVersionModel).filter(ArtifactVersionModel.artifact_id == sample_agent.agent_id))
+            resource_revisions = list(session.query(ResourceRevisionModel).filter(ResourceRevisionModel.resource_id == sample_agent.agent_id))
+            assert len(revisions) == len(artifacts) == len(resource_revisions) == 1
+            assert session.get(AgentDraftModel, sample_agent.agent_id).draft_version == saved.draft_version + 1
+
+    def test_submit_draft_forced_write_failure_rolls_back_everything(self, repo, sample_agent, pg_factory, monkeypatch):
+        initial = repo.get_draft(sample_agent.agent_id)
+        saved = repo.save_draft(sample_agent.agent_id, body={
+            "sop_steps": [{"step_id": "rollback", "instruction": "do not persist"}],
+            "execution_policy": {"provider_ref": "atlascloud/test"},
+        }, base_draft_version=initial.draft_version)
+
+        def forced_failure(*_args, **_kwargs):
+            raise RuntimeError("forced immutable write failure")
+
+        monkeypatch.setattr(repo, "_write_revision_in_session", forced_failure)
+        with pytest.raises(RuntimeError, match="forced immutable write failure"):
+            repo.submit_draft(sample_agent.agent_id, base_draft_version=saved.draft_version)
+        with pg_factory() as session:
+            draft = session.get(AgentDraftModel, sample_agent.agent_id)
+            assert draft is not None
+            assert draft.draft_version == saved.draft_version
+            assert draft.base_revision_id is None
+            assert session.query(AgentRevisionModel).filter(AgentRevisionModel.agent_id == sample_agent.agent_id).count() == 0
+            assert session.query(ArtifactVersionModel).filter(ArtifactVersionModel.artifact_id == sample_agent.agent_id).count() == 0
+            assert session.get(ResourceDraftModel, sample_agent.agent_id) is None
+
+    def test_revision_creation_emits_durable_retriable_index_request(self, repo, sample_agent, pg_factory):
+        revision = repo.create_revision(sample_agent.agent_id, {
+            "sop_steps": [{"step_id": "index", "instruction": "index later"}],
+            "execution_policy": {"provider_ref": "atlascloud/test"},
+        })
+        with pg_factory() as session:
+            event = session.query(OutboxEventModel).filter(
+                OutboxEventModel.aggregate_id == revision.revision_id,
+                OutboxEventModel.purpose == "agent_revision_index",
+            ).one()
+            assert event.published_at is None and event.retry_count == 0
+            assert event.payload["revision_id"] == str(revision.revision_id)
+
+    def test_tool_dependency_cycle_scanner_rejects_indirect_agent_reference(self, repo):
+        assert repo._forbidden_dependency_path({"operations": [{"agent_revision_id": str(uuid4())}]}) == "operations[0].agent_revision_id"
+        assert repo._forbidden_dependency_path({"operations": [{"output_schema": {"type": "object"}}]}) is None
+
     def test_draft_dry_run_persists_only_non_business_trace(self, repo, sample_agent, pg_factory):
         draft = repo.get_draft(sample_agent.agent_id)
         body = {
@@ -153,6 +237,7 @@ class TestAgentRevision:
         assert clone.cloned_from_agent_id == sample_agent.agent_id
         assert draft.body["clone_lineage"]["source_revision_id"] == str(revision.revision_id)
         assert "credential_binding" not in draft.body
+        assert repo.clone_rebind_requirements(clone.agent_id) == []
 
     def test_trial_request_input_survives_reload_and_uses_answer_cas(self, repo, sample_agent):
         draft = repo.get_draft(sample_agent.agent_id)
@@ -322,6 +407,21 @@ class TestAgentValidation:
             })
         assert exc.value.details["field"] == "execution_policy.provider_ref"
 
+    @pytest.mark.parametrize("field,value", [
+        ("output_schema_ref", "not-versioned"),
+        ("execution_boundary", "browser_can_call_tools"),
+        ("request_input_policy", {"enabled": True, "allowed_schema_refs": ["bad-ref"]}),
+        ("managed_task_plan", [{"kind": "resource_commit"}]),
+    ])
+    def test_rejects_unversioned_schema_or_agent_execution_escape(self, svc, field, value):
+        body = {
+            "sop_steps": [{"step_id": "s", "instruction": "bounded"}],
+            "execution_policy": {"provider_ref": "atlascloud/test"},
+        }
+        body[field] = value
+        with pytest.raises(ValidationError_):
+            svc.validate(body)
+
     def test_dry_run(self, svc):
         body = {
             "sop_steps": [{"step_id": "s1", "instruction": "Do work"}],
@@ -344,6 +444,24 @@ class TestAgentValidation:
     def test_rejects_sop_secret(self, svc):
         with pytest.raises(ValidationError_):
             svc.validate({"sop_steps": [{"step_id": "s1", "instruction": "use sk-abcdefghijklmnop"}], "execution_policy": {"provider_ref": "atlascloud/llm"}})
+
+    def test_validates_structured_sop_mappings_and_policies(self, svc):
+        body = {
+            "sop_steps": [{
+                "step_id": "compose", "instruction": "Compose a typed response",
+                "input_bindings": {"brief": "workflow.brief"},
+                "output_bindings": {"artifact": "result.text"},
+                "retry_policy": {"max_attempts": 2},
+                "checkpoint_policy": {"mode": "after_step"},
+                "failure_policy": {"strategy": "retry"},
+            }],
+            "execution_policy": {"provider_ref": "atlascloud/llm"},
+        }
+        svc.validate(body)
+        body["sop_steps"][0]["failure_policy"] = {"strategy": "fallback"}
+        with pytest.raises(ValidationError_) as exc:
+            svc.validate(body)
+        assert exc.value.details["field"] == "sop_steps[0].failure_policy.strategy"
 
     def test_revision_diff_is_field_level(self, repo, sample_agent):
         one = repo.create_revision(sample_agent.agent_id, {"sop_steps": [{"step_id": "s1", "instruction": "one"}], "execution_policy": {"provider_ref": "atlascloud/llm"}})

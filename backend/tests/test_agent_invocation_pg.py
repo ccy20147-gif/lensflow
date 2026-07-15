@@ -91,7 +91,11 @@ def test_verified_output_persists_artifact_binding_and_dispatch_precedes_network
     owner = OwnerScope(kind="user", id=uuid4())
     _, _, revision, _ = _agent(factory, owner)
     attempt_id = _attempt(factory, owner)
-    service, transport = _service(factory, {"id": f"r-{uuid4()}", "model_version": "qwen-test", "data": [{"answer": "ok"}], "usage": {"tokens": 3}})
+    service, transport = _service(factory, {
+        "id": f"r-{uuid4()}", "model_version": "qwen-test",
+        "choices": [{"message": {"content": '{"answer":"ok"}'}}],
+        "usage": {"tokens": 3},
+    })
     result = service.execute(agent_revision_id=revision.revision_id, owner_scope=owner, node_run_attempt_id=attempt_id, typed_inputs={"prompt": "x"}, idempotency_key=f"agent-{uuid4()}")
     assert result["status"] == "completed" and transport.called and transport.dispatch_was_committed
     with factory() as session:
@@ -103,6 +107,7 @@ def test_verified_output_persists_artifact_binding_and_dispatch_precedes_network
         assert session.scalar(select(func.count()).select_from(OutboxEventModel).where(OutboxEventModel.purpose == "result_publish")) >= 1
         traces = list(session.scalars(select(ArtifactVersionModel).where(
             ArtifactVersionModel.schema_id == "toonflow.agent_sop_trace",
+            ArtifactVersionModel.owner_scope == owner.scoped_id,
         )))
         assert {trace.content_json["phase"] for trace in traces} >= {"started", "completed"}
         assert all("prompt" not in trace.content_json for trace in traces)

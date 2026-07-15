@@ -1,6 +1,7 @@
 """PostgreSQL acceptance tests for durable TF-WF-009 template packages."""
 from __future__ import annotations
 
+from copy import deepcopy
 import os
 from uuid import UUID, uuid4
 
@@ -11,8 +12,12 @@ from src.core.exceptions import ConflictError, PolicyBlockedError
 from src.domain.template.template_service import PackageDependency, ReplacementSlot, WorkflowPackageManifest
 from src.domain.workflow.sql_workflow_service import SqlWorkflowService
 from src.infra.db.session import get_session_factory
-from src.infra.db.template_repository import SqlTemplateService
-from src.infra.db.template_repository import BENCHMARK_TEMPLATE_GRAPHS
+from src.infra.db.models import WorkflowRevisionModel, WorkflowTemplateModel
+from src.infra.db.template_repository import (
+    BENCHMARK_TEMPLATE_CONTENT_HASHES,
+    BENCHMARK_TEMPLATE_GRAPHS,
+    SqlTemplateService,
+)
 from src.schemas.enums import DependencyKind
 from src.schemas.models import OwnerScope
 
@@ -147,6 +152,33 @@ def test_template_transitive_closure_and_typed_replacement_are_revalidated(facto
     assert nested["path"] == [parent_id, "child", child_id, "broken_agent"]
 
 
+def test_import_manifest_revalidates_nested_typed_replacement_slots(factory):
+    """A nested package cannot hide a required replacement behind its template ID."""
+    owner = OwnerScope(kind="user", id=uuid4())
+    workflows = SqlWorkflowService(factory)
+    source = workflows.create_workflow(owner_scope=owner)
+    source_revision = workflows.create_revision_from_draft(source.workflow_id, uuid4())
+    templates = SqlTemplateService(factory)
+    child_id = templates.create_template(
+        "import-child", str(source_revision.revision_id), owner_scope=owner,
+        manifest=WorkflowPackageManifest(
+            name="import-child",
+            dependencies=[PackageDependency("provider", DependencyKind.PROVIDER, "atlascloud/pending", replacement_slot="provider_slot")],
+            replacement_slots=[ReplacementSlot("provider_slot", "Provider", expected_kind=DependencyKind.PROVIDER)],
+        ),
+    )
+    wrapper = WorkflowPackageManifest(
+        name="import-wrapper",
+        dependencies=[PackageDependency("child", DependencyKind.TEMPLATE, child_id)],
+    )
+    unresolved = templates.resolve_import_manifest(wrapper, replacements={}, owner_scope=owner)
+    assert unresolved["resolved"] is False
+    assert unresolved["diagnostics"][0]["code"] == "REPLACEMENT_REQUIRED"
+    assert unresolved["diagnostics"][0]["path"] == ["import", "child", child_id, "provider"]
+    resolved = templates.resolve_import_manifest(wrapper, replacements={"provider_slot": "atlascloud/llm/demo"}, owner_scope=owner)
+    assert resolved["resolved"] is True
+
+
 def test_benchmark_template_seed_uses_only_public_business_nodes(factory):
     owner = OwnerScope(kind="user", id=uuid4())
     templates = SqlTemplateService(factory)
@@ -155,3 +187,51 @@ def test_benchmark_template_seed_uses_only_public_business_nodes(factory):
     assert templates.seed_benchmark_templates(owner) == ids
     allowed = {"brief", "constraint", "structured_generate", "model_router", "variants", "select_rank", "review", "workbench_task", "package_export"}
     assert all({node["type"] for node in graph["nodes"]} <= allowed for graph in BENCHMARK_TEMPLATE_GRAPHS.values())
+
+
+def test_benchmark_seed_replaces_legacy_graph_and_instantiates_typed_edges(factory):
+    """A historical same-name package cannot shadow the current benchmark."""
+    maintainer = OwnerScope(kind="user", id=uuid4())
+    consumer = OwnerScope(kind="user", id=uuid4())
+    templates = SqlTemplateService(factory)
+    workflows = SqlWorkflowService(factory)
+    name = "广告创意候选与人工精修"
+    legacy_graph = deepcopy(BENCHMARK_TEMPLATE_GRAPHS[name])
+    legacy_graph["edges"] = [
+        {"source": edge["source"], "target": edge["target"]}
+        for edge in legacy_graph["edges"]
+    ]
+    legacy_workflow = workflows.create_workflow(owner_scope=maintainer)
+    legacy_draft = workflows.get_draft(legacy_workflow.workflow_id)
+    workflows.save_draft(legacy_workflow.workflow_id, legacy_graph, {}, {}, legacy_draft.graph_hash)
+    legacy_revision = workflows.create_revision_from_draft(legacy_workflow.workflow_id, uuid4())
+    legacy_template_id = templates.create_template(
+        name,
+        str(legacy_revision.revision_id),
+        manifest=WorkflowPackageManifest(name=name, version="benchmark-legacy"),
+        visibility="public",
+        owner_scope=maintainer,
+    )
+
+    seeded_ids = templates.seed_benchmark_templates(maintainer)
+    assert templates.seed_benchmark_templates(maintainer) == seeded_ids
+    current_id = seeded_ids[0]
+    assert current_id != legacy_template_id
+
+    with factory() as session:
+        legacy = session.get(WorkflowTemplateModel, UUID(legacy_template_id))
+        current = session.get(WorkflowTemplateModel, UUID(current_id))
+        assert legacy is not None and legacy.revision_status.value == "retired"
+        assert current is not None and current.revision_status.value == "active"
+        assert current.manifest["version"] == f"benchmark-{BENCHMARK_TEMPLATE_CONTENT_HASHES[name]}"
+        for template_id in seeded_ids:
+            seeded = session.get(WorkflowTemplateModel, UUID(template_id))
+            assert seeded is not None and seeded.revision_status.value == "active"
+            source = session.get(WorkflowRevisionModel, seeded.workflow_revision_id)
+            assert source is not None
+            assert all(edge.get("sourceHandle") and edge.get("targetHandle") for edge in source.graph["edges"])
+
+    for template_id in seeded_ids:
+        instance = templates.instantiate_template(template_id, consumer)
+        draft = workflows.get_draft(UUID(instance.workflow_id))
+        assert all(edge.get("sourceHandle") and edge.get("targetHandle") for edge in draft.graph["edges"])

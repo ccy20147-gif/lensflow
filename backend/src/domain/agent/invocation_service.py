@@ -46,6 +46,7 @@ class AgentInvocationService:
                 raise ValidationError_("AgentInvoke requires a durable parent NodeRunAttempt")
             if run.owner_scope != owner_scope.scoped_id:
                 raise ForbiddenError("AgentInvoke attempt belongs to a different owner_scope")
+            attempt_epoch = int(attempt.execution_epoch)
         revision = self._agents.get_revision(agent_revision_id)
         definition = self._agents.get_definition_for_revision(agent_revision_id)
         if definition.owner_scope != owner_scope.scoped_id:
@@ -81,7 +82,16 @@ class AgentInvocationService:
         request = {"messages": [{"role": "user", "content": json.dumps(typed_inputs, sort_keys=True)}]}
         request_hash = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         provider_attempt, _ = self._runtime.dispatch_provider(node_run_attempt_id, provider_id="atlascloud", model_id=model_id,
-            idempotency_key=idempotency_key, request_body_hash=request_hash)
+            idempotency_key=idempotency_key, request_body_hash=request_hash,
+            dispatch_payload={
+                "operation": "llm",
+                "request": request,
+                "expected_epoch": attempt_epoch,
+                "result_schema": {"schema_id": revision.output_schema_ref.rpartition(".v")[0] or "agent_output",
+                                  "schema_version": int(revision.output_schema_ref.rpartition(".v")[2]) if revision.output_schema_ref and revision.output_schema_ref.rpartition(".v")[2].isdigit() else 1,
+                                  "owner_scope": owner_scope.scoped_id},
+                "kind": "agent",
+            })
         try:
             submission = self._adapter.submit(operation="llm", model_id=model_id, payload=request, idempotency_key=idempotency_key)
         except AtlasSubmissionUnknown:
@@ -161,7 +171,7 @@ class AgentInvocationService:
         record, _, artifact_ids = self._runtime.publish_provider_json_outputs(provider_attempt.provider_attempt_id,
             owner_scope=owner_scope.scoped_id, schema_id=schema_id, schema_version=int(version_suffix), outputs=outputs,
             model_version=submission.model_version, response_fingerprint=submission.raw_fingerprint,
-            usage=submission.usage, actual_cost=submission.actual_cost)
+            usage=submission.usage, actual_cost=submission.actual_cost, current_epoch=attempt_epoch)
         self._persist_trial_trace(attempt_id=node_run_attempt_id, owner_scope=owner_scope.scoped_id,
             agent_revision_id=agent_revision_id, phase="completed",
             payload={"provider_attempt_id": str(provider_attempt.provider_attempt_id), "record_id": str(record.record_id),

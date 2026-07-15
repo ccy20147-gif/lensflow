@@ -12,7 +12,12 @@ from sqlalchemy import select, text
 from src.core.exceptions import ForbiddenError, ValidationError_
 from src.domain.workflow.business_node_service import BUSINESS_NODE_CATALOG, BusinessNodeService
 from src.infra.db.artifact_repository import SqlArtifactRepository
-from src.infra.db.models import NodeRunAttemptModel, NodeRunModel, ResourceDraftModel, ResourceRevisionModel, WorkflowRevisionModel, WorkflowRunModel
+from src.infra.db.resource_repository import SqlResourceRepository
+from src.infra.db.models import (
+    NodeRunAttemptModel, NodeRunModel, ProviderInvocationAttemptModel,
+    ProviderInvocationRecordModel, ProviderOutputBindingModel, ResourceDraftModel,
+    ResourceRevisionModel, WorkflowRevisionModel, WorkflowRunModel,
+)
 from src.infra.db.session import get_session_factory
 from src.infra.db.identity_repository import get_session_store
 from src.schemas.enums import AttemptStatus, NodeRunStatus, RevisionStatus, RunStatus
@@ -148,20 +153,10 @@ def test_business_executors_publish_typed_artifacts_and_candidate_evidence(facto
     constraint = service.execute_attempt(constraint_attempt.attempt_id)
     assert constraint[0].content_json["conflicts"][0]["field"] == "format"
 
-    _, variant_run, variant_node, variant_attempt = _run_context(factory, owner, "variants", {"candidate_payloads": [{"title": "A"}, {"title": "B"}], "failed_candidates": [{"index": 2, "code": "provider_failed"}], "cost_allocation": {"shared": 0.2}})
-    candidates = service.execute_attempt(variant_attempt.attempt_id)
-    assert len(candidates) == 3  # two candidate ArtifactVersions plus CandidateSet evidence
-    # A partial provider failure does not discard successful variants.  The
-    # persisted evidence keeps both machine code and human-readable reason,
-    # and cost is attributed to the immutable candidate set.
-    assert candidates[-1].content_json["failed_candidates"] == [
-        {"index": 2, "code": "provider_failed", "reason": "provider_failed"}
-    ]
-    with factory() as session:
-        row = session.scalar(text("SELECT candidate_set_id FROM candidate_sets WHERE run_id = :run AND node_run_id = :node"), {"run": variant_run.run_id, "node": variant_node.node_run_id})
-        costs = session.scalar(text("SELECT cost_allocation FROM candidate_sets WHERE run_id = :run AND node_run_id = :node"), {"run": variant_run.run_id, "node": variant_node.node_run_id})
-    assert row is not None
-    assert costs == {"shared": 0.2}
+    _, _variant_run, _variant_node, variant_attempt = _run_context(factory, owner, "variants", {"candidate_payloads": [{"title": "spoofed"}], "cost_allocation": {"shared": 0.2}})
+    # Config payloads are no longer a model-result escape hatch.
+    with pytest.raises(ValidationError_, match="frozen AtlasCloud"):
+        service.execute_attempt(variant_attempt.attempt_id)
 
 
 def test_structured_generate_rejects_invalid_schema_before_artifact_publish(factory):
@@ -171,6 +166,69 @@ def test_structured_generate_rejects_invalid_schema_before_artifact_publish(fact
         BusinessNodeService(factory).execute_attempt(attempt.attempt_id)
 
 
+def test_package_export_requires_current_cross_owner_resource_grant_and_records_fixed_ref(factory):
+    source, consumer = OwnerScope(kind="user", id=uuid4()), OwnerScope(kind="user", id=uuid4())
+    artifacts = SqlArtifactRepository(factory)
+    content = artifacts.create_version(owner_scope=source, schema_id="toonflow.world.v1", schema_version=1, content_json={"name": "licensed"})
+    resources = SqlResourceRepository(factory)
+    resource = resources.create(source, "world", content.artifact_version_id)
+    frozen = resources.freeze(resource.resource_id, source, resources.get_draft(resource.resource_id, source).draft_version)
+    ref = {"resource_id": str(resource.resource_id), "resource_type": "world", "revision_id": str(frozen.revision_id)}
+
+    _, _, _, denied_attempt = _run_context(factory, consumer, "package_export", {"resource_refs": [ref]})
+    with pytest.raises(ForbiddenError, match=r"resource_refs\[0\]"):
+        BusinessNodeService(factory).execute_attempt(denied_attempt.attempt_id)
+
+    grant = resources.grant(frozen.revision_id, source, consumer, capability_actions=["reference"])
+    allowed_ref = {**ref, "grant_snapshot_id": str(grant)}
+    _, _, _, allowed_attempt = _run_context(factory, consumer, "package_export", {"resource_refs": [allowed_ref]})
+    outputs = BusinessNodeService(factory).execute_attempt(allowed_attempt.attempt_id)
+    manifest = next(item for item in outputs if item.schema_id == "package_manifest")
+    exported = manifest.content_json["items"][0]
+    assert exported["resource_ref"]["revision_id"] == str(frozen.revision_id)
+    assert exported["content_artifact_version_id"] == str(content.artifact_version_id)
+
+    resources.revoke_grant(frozen.revision_id, grant, source)
+    _, _, _, revoked_attempt = _run_context(factory, consumer, "package_export", {"resource_refs": [allowed_ref]})
+    with pytest.raises(ForbiddenError, match=r"resource_refs\[0\]"):
+        BusinessNodeService(factory).execute_attempt(revoked_attempt.attempt_id)
+
+
+def test_variants_and_review_retain_frozen_atlas_binding_lineage_and_cost(factory):
+    owner = OwnerScope(kind="user", id=uuid4())
+    artifacts = SqlArtifactRepository(factory)
+    source = artifacts.create_version(owner_scope=owner, schema_id="image", schema_version=1, content_json={"frame": 1})
+    _, provider_run, provider_node, provider_attempt = _run_context(factory, owner, "brief", {"brief": {"x": 1}})
+    now = datetime.now(timezone.utc)
+    with factory.begin() as session:
+        invocation = ProviderInvocationAttemptModel(provider_attempt_id=uuid4(), node_run_attempt_id=provider_attempt.attempt_id,
+            provider_id="atlascloud", model_id="image", idempotency_key=str(uuid4()), request_body_hash="h", status=AttemptStatus.COMPLETED, created_at=now)
+        session.add(invocation)
+        session.flush()
+        record = ProviderInvocationRecordModel(record_id=uuid4(), provider_attempt_id=invocation.provider_attempt_id,
+            provider_id="atlascloud", model_id="image", model_version="v1", idempotency_key=invocation.idempotency_key,
+            request_body_hash="h", response_fingerprint="fp", usage={"images": 1}, actual_cost=0.42, started_at=now, completed_at=now)
+        session.add(record)
+        session.flush()
+        session.add(ProviderOutputBindingModel(binding_id=uuid4(), record_id=record.record_id, output_artifact_version_id=source.artifact_version_id, output_index=0, output_label="candidate"))
+    fixed = {"upstream_artifact_refs": [{"source_node_id": "provider", "artifact_version_ids": [str(source.artifact_version_id)]}]}
+    _, variants_run, variants_node, variants_attempt = _run_context(factory, owner, "variants", {"candidate_payloads": [{"forged": True}]})
+    with factory.begin() as session:
+        session.get(NodeRunAttemptModel, variants_attempt.attempt_id).fixed_input = fixed
+    result = BusinessNodeService(factory).execute_attempt(variants_attempt.attempt_id)
+    evidence = result[-1].content_json
+    assert evidence["candidate_refs"][0]["artifact_version_id"] == str(source.artifact_version_id)
+    assert evidence["provider_record_ids"] == [str(record.record_id)]
+    assert evidence["cost_allocation"] == {str(record.record_id): 0.42}
+    _, _review_run, _review_node, review_attempt = _run_context(factory, owner, "review", {"issues": [{"forged": True}]})
+    with factory.begin() as session:
+        session.get(NodeRunAttemptModel, review_attempt.attempt_id).fixed_input = fixed
+    report = BusinessNodeService(factory).execute_attempt(review_attempt.attempt_id)[0]
+    assert report.content_json["reviewed_artifact_version_ids"] == [str(source.artifact_version_id)]
+    assert report.content_json["actual_cost"] == 0.42
+    assert report.lineage_input_refs[0]["artifact_version_id"] == str(source.artifact_version_id)
+
+
 def test_workbench_task_is_materialized_from_workflow_attempt(factory):
     owner = OwnerScope(kind="user", id=uuid4())
     _, run, node, attempt = _run_context(factory, owner, "workbench_task", {"target_workbench": "shot-plan", "output_schema_ref": "shot_plan.v1", "resource_type": "shot_plan"})
@@ -178,3 +236,21 @@ def test_workbench_task_is_materialized_from_workflow_attempt(factory):
     with factory() as session:
         task = session.scalar(text("SELECT task_id FROM human_tasks WHERE run_id = :run AND node_run_id = :node"), {"run": run.run_id, "node": node.node_run_id})
     assert task is not None
+
+
+def test_workbench_task_does_not_pause_parallel_ready_branches(factory):
+    """A local human task cannot hide independently runnable work."""
+    owner = OwnerScope(kind="user", id=uuid4())
+    revision, run, node, attempt = _run_context(factory, owner, "workbench_task", {
+        "target_workbench": "shot-plan", "output_schema_ref": "shot_plan.v1", "resource_type": "shot_plan",
+    })
+    with factory.begin() as session:
+        sibling = NodeRunModel(node_run_id=uuid4(), run_id=run.run_id, node_instance_id="parallel",
+            node_type_id="brief", status=NodeRunStatus.READY)
+        session.add(sibling)
+    BusinessNodeService(factory).execute_attempt(attempt.attempt_id)
+    with factory() as session:
+        saved_run = session.get(WorkflowRunModel, run.run_id)
+        saved_node = session.get(NodeRunModel, node.node_run_id)
+        assert saved_run is not None and saved_run.status == RunStatus.RUNNING
+        assert saved_node is not None and saved_node.status == NodeRunStatus.WAITING_USER

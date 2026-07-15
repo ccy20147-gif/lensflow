@@ -53,8 +53,8 @@ def run(*, worker_id: str, poll_seconds: float = 0.25, once: bool = False) -> in
         _run_maintenance("human-task-expiry", worker.expire_due_human_tasks)
         _run_maintenance("map-item-recovery", worker.recover_map_items)
         _run_maintenance("tool-dispatch", worker.consume_tool_dispatches)
-        _run_maintenance("provider-dispatch-outbox", worker.consume_provider_dispatch_outbox)
         if AtlasCloudAdapter().configured:
+            _run_maintenance("provider-dispatch-outbox", worker.consume_provider_dispatch_outbox)
             _run_maintenance("atlascloud-reconciliation", worker.reconcile_unknown)
         claim = worker.claim_next_attempt(worker_id)
         if claim is None:

@@ -27,6 +27,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from collections.abc import Callable
 from typing import Any
 from uuid import UUID
 
@@ -53,7 +54,7 @@ from src.infra.db.models import (
     MediaRecipeRevisionModel,
     SubworkflowModel,
 )
-from src.domain.provider.atlascloud import AtlasCloudAdapter
+from src.domain.provider.atlascloud import AtlasCloudAdapter, AtlasSubmissionUnknown
 from src.domain.agent.tool_broker import ToolBroker
 from src.infra.db.session import get_session_factory
 from src.schemas.enums import AttemptStatus, NodeRunStatus, RunStatus
@@ -518,7 +519,11 @@ class RuntimeWorker:
         The unique provider record is the callback dedupe fence.  A callback
         for an unbound task is rejected by the API before it reaches here.
         """
-        task_id = str(payload.get("task_id") or payload.get("id") or payload.get("prediction_id") or "")
+        # Webhooks nest the provider result under ``payload`` while polling
+        # returns a flat prediction object. Normalize once before applying the
+        # same durable task-binding and epoch fences to both paths.
+        nested = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+        task_id = str(payload.get("session_id") or payload.get("task_id") or payload.get("id") or payload.get("prediction_id") or "")
         if not task_id:
             raise NotFoundError("WorkflowTaskBinding", "missing provider task id")
         with self._factory() as session:
@@ -534,7 +539,11 @@ class RuntimeWorker:
             if run is None:
                 raise NotFoundError("WorkflowRun", task_id)
             owner_scope = run.owner_scope
-        status = str(payload.get("status") or payload.get("state") or "completed").lower()
+            expected_epoch = int(attempt.execution_epoch)
+        envelope_status = str(payload.get("status") or "").upper()
+        status = str(nested.get("status") or payload.get("state") or payload.get("status") or "completed").lower()
+        if envelope_status == "ERROR" and status not in {"failed", "cancelled", "canceled", "error", "timeout"}:
+            status = "failed"
         if status in {"failed", "cancelled", "canceled", "error"}:
             self._runtime.fail_attempt(provider.node_run_attempt_id)
             return None
@@ -544,7 +553,7 @@ class RuntimeWorker:
                 if bound is not None:
                     bound.task_status = status
             return None
-        outputs = payload.get("outputs") or payload.get("data") or payload.get("choices") or []
+        outputs = nested.get("outputs") or payload.get("outputs") or payload.get("data") or payload.get("choices") or []
         if not isinstance(outputs, list):
             outputs = [outputs]
         typed = [item for item in outputs if isinstance(item, dict)]
@@ -552,10 +561,11 @@ class RuntimeWorker:
             raise ConflictError("Atlas callback has no typed outputs")
         record, event, _ = self._runtime.publish_provider_json_outputs(
             provider.provider_attempt_id, owner_scope=owner_scope, schema_id="provider_output", schema_version=1,
-            outputs=typed, model_version=str(payload.get("model_version") or provider.model_id),
+            outputs=typed, model_version=str(nested.get("model_version") or payload.get("model_version") or provider.model_id),
             response_fingerprint=str(payload.get("request_id") or payload.get("id") or task_id),
-            usage=payload.get("usage") if isinstance(payload.get("usage"), dict) else {},
-            actual_cost=float(payload.get("cost") or 0.0),
+            usage=nested.get("usage") if isinstance(nested.get("usage"), dict) else (payload.get("usage") if isinstance(payload.get("usage"), dict) else {}),
+            actual_cost=float(nested.get("cost") or payload.get("cost") or 0.0),
+            current_epoch=expected_epoch,
         )
         with self._factory.begin() as session:
             bound = session.scalar(select(WorkflowTaskBindingModel).where(WorkflowTaskBindingModel.provider_task_id == task_id))
@@ -571,15 +581,38 @@ class RuntimeWorker:
         return ProviderResultReceipt(record=record, outbox=event)
 
     def reconcile_unknown(self, adapter: AtlasCloudAdapter | None = None) -> ReconciliationReport:
-        """Query, never resubmit, durable unknown Atlas attempts with a task id."""
+        """Poll known Atlas tasks and retain unbound UNKNOWN rows for review.
+
+        An unbound attempt is deliberately *not* submitted again: the original
+        network outcome is unknowable.  Its ``provider_reconcile`` outbox row
+        is the durable manual/reconciliation queue record.
+        """
         adapter = adapter or AtlasCloudAdapter()
         checked = completed = failed = pending = 0
         with self._factory() as session:
+            reconcilable_ids = list(session.scalars(select(ProviderInvocationAttemptModel.provider_attempt_id).where(
+                ProviderInvocationAttemptModel.status.in_([AttemptStatus.UNKNOWN, AttemptStatus.WAITING_EXTERNAL]),
+                ProviderInvocationAttemptModel.provider_id == "atlascloud",
+            )))
             bindings = list(session.scalars(
                 select(WorkflowTaskBindingModel)
                 .join(ProviderInvocationAttemptModel, ProviderInvocationAttemptModel.provider_attempt_id == WorkflowTaskBindingModel.provider_attempt_id)
-                .where(ProviderInvocationAttemptModel.status == AttemptStatus.UNKNOWN, ProviderInvocationAttemptModel.provider_id == "atlascloud")
-            ))
+                .where(ProviderInvocationAttemptModel.provider_attempt_id.in_(reconcilable_ids))
+            )) if reconcilable_ids else []
+            bound_ids = {item.provider_attempt_id for item in bindings}
+        # Only UNKNOWN attempts without a task are ambiguous. A normal
+        # WAITING_EXTERNAL submission without a binding is still awaiting the
+        # sender and must not be prematurely escalated to manual review.
+        with self._factory() as session:
+            unbound_unknown_ids = list(session.scalars(select(ProviderInvocationAttemptModel.provider_attempt_id).where(
+                ProviderInvocationAttemptModel.provider_attempt_id.in_(set(reconcilable_ids) - bound_ids),
+                ProviderInvocationAttemptModel.status == AttemptStatus.UNKNOWN,
+            ))) if reconcilable_ids else []
+        for provider_attempt_id in unbound_unknown_ids:
+            self._ensure_provider_reconcile(provider_attempt_id, "unknown_submission_without_provider_task")
+            # This is observable, durable manual work rather than a silently
+            # omitted UNKNOWN invocation.
+            pending += 1
         for binding in bindings:
             checked += 1
             payload = adapter.get_prediction(binding.provider_task_id)
@@ -830,49 +863,234 @@ class RuntimeWorker:
             counts[result] = counts.get(result, 0) + 1
         return counts
 
-    def consume_provider_dispatch_outbox(self, *, limit: int = 64) -> dict[str, int]:
-        """Settle provider-dispatch audit events without blindly resubmitting.
+    def consume_provider_dispatch_outbox(
+        self, *, limit: int = 64, adapter: AtlasCloudAdapter | None = None,
+    ) -> dict[str, int]:
+        """Submit committed frozen Atlas contracts, with crash-safe idempotency.
 
-        Provider adapters submit only through their dedicated invocation
-        boundary.  This outbox consumer records that a task binding/result is
-        durably observable; if neither exists after a crash it fences the
-        invocation as UNKNOWN and emits a reconciliation request.
+        The request contract is written alongside the provider attempt and
+        dispatch outbox.  A lease is committed *before* the network call.  If
+        a process dies before it can persist a response, a later worker may
+        submit the exact same stable idempotency key.  Once the adapter says
+        the outcome is unknown, the attempt is fenced to UNKNOWN and is never
+        sent again automatically.
         """
-        published = unknown = 0
-        with self._factory.begin() as session:
-            events = list(session.scalars(select(OutboxEventModel).where(
+        adapter = adapter or AtlasCloudAdapter()
+        with self._factory() as session:
+            event_ids = list(session.scalars(select(OutboxEventModel.event_id).where(
                 OutboxEventModel.purpose == "provider_dispatch",
                 OutboxEventModel.published_at.is_(None),
-            ).order_by(OutboxEventModel.created_at).limit(limit).with_for_update(skip_locked=True)))
-            for event in events:
-                provider = session.get(ProviderInvocationAttemptModel, event.aggregate_id)
-                if provider is None:
-                    event.published_at = datetime.now(timezone.utc)
-                    continue
-                binding = session.scalar(select(WorkflowTaskBindingModel).where(
-                    WorkflowTaskBindingModel.provider_attempt_id == provider.provider_attempt_id,
-                ))
-                record = session.scalar(select(ProviderInvocationRecordModel).where(
-                    ProviderInvocationRecordModel.provider_attempt_id == provider.provider_attempt_id,
-                ))
-                event.published_at = datetime.now(timezone.utc)
-                if binding is not None or record is not None:
+            ).order_by(OutboxEventModel.created_at).limit(limit)))
+        published = unknown = 0
+        for event_id in event_ids:
+            claimed = self._claim_provider_dispatch(event_id)
+            if claimed is None:
+                # A previous synchronous boundary may already have persisted
+                # its task binding/result.  Claiming that fact publishes the
+                # audit event without another provider call.
+                with self._factory() as session:
+                    event = session.get(OutboxEventModel, event_id)
+                    if event is not None and event.published_at is not None:
+                        published += 1
+                continue
+            provider_id, model_id, idempotency_key, contract = claimed
+            if contract is None:
+                self._mark_provider_unknown(event_id, provider_id, "dispatch_contract_missing")
+                unknown += 1
+                continue
+            try:
+                result = adapter.submit(
+                    operation=str(contract["operation"]), model_id=model_id,
+                    payload=dict(contract["request"]), idempotency_key=idempotency_key,
+                )
+            except AtlasSubmissionUnknown:
+                self._mark_provider_unknown(event_id, provider_id, "atlas_submission_outcome_unknown")
+                unknown += 1
+                continue
+            except Exception:
+                # A deterministic provider rejection is not an uncertain
+                # charge. Make the attempt terminal and do not spin on it.
+                self._fail_provider_dispatch(event_id, provider_id)
+                continue
+            try:
+                if result.asynchronous:
+                    if not result.task_id:
+                        raise ValidationError_("AtlasCloud async submission lacks task id")
+                    self._runtime.bind_provider_task(provider_id, result.task_id)
+                    self._publish_provider_dispatch(event_id)
                     published += 1
                     continue
-                attempt = session.get(NodeRunAttemptModel, provider.node_run_attempt_id)
-                provider.status = AttemptStatus.UNKNOWN
-                if attempt is not None:
-                    attempt.status = AttemptStatus.UNKNOWN
+                if not result.outputs or not all(isinstance(item, dict) for item in result.outputs):
+                    raise ValidationError_("AtlasCloud provider output must contain typed objects")
+                schema = dict(contract.get("result_schema") or {})
+                self._runtime.publish_provider_json_outputs(
+                    provider_id, owner_scope=str(schema["owner_scope"]),
+                    schema_id=str(schema["schema_id"]), schema_version=int(schema["schema_version"]),
+                    outputs=result.outputs, model_version=result.model_version,
+                    response_fingerprint=result.raw_fingerprint, usage=result.usage,
+                    actual_cost=result.actual_cost, current_epoch=int(contract["expected_epoch"]),
+                )
+                if contract.get("kind") == "recipe_operator":
+                    with self._factory() as session:
+                        provider = session.get(ProviderInvocationAttemptModel, provider_id)
+                        child_id = provider.node_run_attempt_id if provider else None
+                    if child_id is not None:
+                        from src.domain.recipe.recipe_runtime import RecipeRuntimeService
+                        RecipeRuntimeService(self._factory).advance_completed_child(child_id)
+                self._publish_provider_dispatch(event_id)
+                published += 1
+            except (ConflictError, ValidationError_, NotFoundError):
+                # A late/superseded result must never become a fresh output.
+                self._fail_provider_dispatch(event_id, provider_id)
+        return {"published": published, "unknown": unknown}
+
+    def _claim_provider_dispatch(self, event_id: UUID) -> tuple[UUID, str, str, dict[str, Any] | None] | None:
+        """Acquire a durable send lease without holding a DB transaction open."""
+        now = datetime.now(timezone.utc)
+        with self._factory.begin() as session:
+            event = session.get(OutboxEventModel, event_id, with_for_update=True)
+            if event is None or event.published_at is not None:
+                return None
+            provider = session.get(ProviderInvocationAttemptModel, event.aggregate_id)
+            if provider is None:
+                event.published_at = now
+                return None
+            attempt = session.get(NodeRunAttemptModel, provider.node_run_attempt_id)
+            if attempt is None or attempt.status in {
+                AttemptStatus.SUPERSEDED, AttemptStatus.CANCELLED, AttemptStatus.COMPLETED,
+            }:
+                # A cancellation/retry fence committed before this worker
+                # acquired the send lease.  Never create the external side
+                # effect after that fence.
+                event.published_at = now
+                if attempt is not None and attempt.status == AttemptStatus.SUPERSEDED:
+                    provider.status = AttemptStatus.SUPERSEDED
+                elif attempt is not None and attempt.status == AttemptStatus.CANCELLED:
+                    provider.status = AttemptStatus.CANCELLED
+                return None
+            binding = session.scalar(select(WorkflowTaskBindingModel).where(WorkflowTaskBindingModel.provider_attempt_id == provider.provider_attempt_id))
+            record = session.scalar(select(ProviderInvocationRecordModel).where(ProviderInvocationRecordModel.provider_attempt_id == provider.provider_attempt_id))
+            if binding is not None or record is not None:
+                event.published_at = now
+                return None
+            payload = dict(event.payload or {})
+            lease_raw = payload.get("dispatch_lease_until")
+            if isinstance(lease_raw, str):
+                try:
+                    lease_until = datetime.fromisoformat(lease_raw)
+                    if lease_until.tzinfo is None:
+                        lease_until = lease_until.replace(tzinfo=timezone.utc)
+                    if lease_until > now:
+                        return None
+                except ValueError:
+                    pass
+            payload["dispatch_lease_until"] = (now + self._lease_duration).isoformat()
+            event.payload = payload
+            event.retry_count = int(event.retry_count or 0) + 1
+            contract = payload.get("dispatch")
+            return provider.provider_attempt_id, provider.model_id, provider.idempotency_key, dict(contract) if isinstance(contract, dict) else None
+
+    def _ensure_provider_reconcile(self, provider_attempt_id: UUID, reason: str) -> None:
+        with self._factory.begin() as session:
+            provider = session.get(ProviderInvocationAttemptModel, provider_attempt_id)
+            if provider is None:
+                return
+            existing = session.scalar(select(OutboxEventModel).where(
+                OutboxEventModel.aggregate_id == provider_attempt_id,
+                OutboxEventModel.purpose == "provider_reconcile",
+                OutboxEventModel.published_at.is_(None),
+            ))
+            if existing is None:
                 session.add(OutboxEventModel(
-                    event_id=uuid.uuid4(), aggregate_type="provider_invocation",
-                    aggregate_id=provider.provider_attempt_id, event_type="provider.reconcile_requested",
-                    purpose="provider_reconcile",
-                    payload={"provider_id": provider.provider_id, "idempotency_key": provider.idempotency_key,
-                             "reason": "dispatch_outbox_without_submission_proof"},
+                    event_id=uuid.uuid4(), aggregate_type="provider_invocation", aggregate_id=provider_attempt_id,
+                    event_type="provider.reconcile_requested", purpose="provider_reconcile",
+                    payload={"provider_id": provider.provider_id, "idempotency_key": provider.idempotency_key, "reason": reason},
                     created_at=datetime.now(timezone.utc),
                 ))
-                unknown += 1
-        return {"published": published, "unknown": unknown}
+
+    def _mark_provider_unknown(self, event_id: UUID, provider_attempt_id: UUID, reason: str) -> None:
+        with self._factory.begin() as session:
+            event = session.get(OutboxEventModel, event_id, with_for_update=True)
+            provider = session.get(ProviderInvocationAttemptModel, provider_attempt_id)
+            if event is not None:
+                event.published_at = datetime.now(timezone.utc)
+            if provider is not None:
+                provider.status = AttemptStatus.UNKNOWN
+                attempt = session.get(NodeRunAttemptModel, provider.node_run_attempt_id)
+                if attempt is not None:
+                    attempt.status = AttemptStatus.UNKNOWN
+        self._ensure_provider_reconcile(provider_attempt_id, reason)
+
+    def _publish_provider_dispatch(self, event_id: UUID) -> None:
+        with self._factory.begin() as session:
+            event = session.get(OutboxEventModel, event_id, with_for_update=True)
+            if event is not None:
+                event.published_at = datetime.now(timezone.utc)
+
+    def _fail_provider_dispatch(self, event_id: UUID, provider_attempt_id: UUID) -> None:
+        with self._factory.begin() as session:
+            event = session.get(OutboxEventModel, event_id, with_for_update=True)
+            provider = session.get(ProviderInvocationAttemptModel, provider_attempt_id)
+            if event is not None:
+                event.published_at = datetime.now(timezone.utc)
+            if provider is not None:
+                if provider.status not in {AttemptStatus.COMPLETED, AttemptStatus.CANCELLED}:
+                    provider.status = AttemptStatus.FAILED
+                attempt = session.get(NodeRunAttemptModel, provider.node_run_attempt_id)
+                if attempt is not None and attempt.status not in {AttemptStatus.SUPERSEDED, AttemptStatus.CANCELLED, AttemptStatus.COMPLETED}:
+                    attempt.status = AttemptStatus.FAILED
+
+    def deliver_outbox(
+        self,
+        deliver: Callable[[OutboxEvent], None],
+        *,
+        limit: int = 64,
+        purposes: set[str] | None = None,
+        event_ids: set[UUID] | None = None,
+    ) -> dict[str, int]:
+        """Deliver committed domain events with durable retry accounting.
+
+        The callback deliberately runs *outside* the database transaction. A
+        failed consumer therefore leaves the business write intact and the
+        row pending; a subsequent worker process can retry the same event.
+        ``published_at`` is set only after the callback returns successfully.
+        Provider dispatch itself is excluded by callers because it has the
+        stricter idempotency/reconciliation path above.
+        """
+        with self._factory() as session:
+            query = select(OutboxEventModel.event_id).where(
+                OutboxEventModel.published_at.is_(None),
+            ).order_by(OutboxEventModel.created_at).limit(limit)
+            if purposes is not None:
+                query = query.where(OutboxEventModel.purpose.in_(purposes))
+            if event_ids is not None:
+                if not event_ids:
+                    return {"delivered": 0, "failed": 0}
+                query = query.where(OutboxEventModel.event_id.in_(event_ids))
+            event_ids = list(session.scalars(query))
+
+        delivered = failed = 0
+        for event_id in event_ids:
+            with self._factory() as session:
+                row = session.get(OutboxEventModel, event_id)
+                if row is None or row.published_at is not None:
+                    continue
+                event = self._runtime._outbox_schema(row)
+            try:
+                deliver(event)
+            except Exception:
+                with self._factory.begin() as session:
+                    row = session.get(OutboxEventModel, event_id, with_for_update=True)
+                    if row is not None and row.published_at is None:
+                        row.retry_count = int(row.retry_count or 0) + 1
+                failed += 1
+                continue
+            with self._factory.begin() as session:
+                row = session.get(OutboxEventModel, event_id, with_for_update=True)
+                if row is not None and row.published_at is None:
+                    row.published_at = datetime.now(timezone.utc)
+                    delivered += 1
+        return {"delivered": delivered, "failed": failed}
 
     def expire_due_human_tasks(self) -> int:
         """Run the durable Human Gate deadline scanner from the worker plane."""

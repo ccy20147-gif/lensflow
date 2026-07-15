@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from uuid import UUID
+from datetime import datetime, timezone
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
@@ -22,12 +23,15 @@ from src.infra.db.models import (
     MediaRecipeRevisionModel,
     NodeRunAttemptModel,
     NodeRunModel,
+    WorkflowModel,
+    WorkflowRevisionModel,
     WorkflowRunModel,
 )
 from src.infra.db.recipe_repository import SqlMediaRecipeService
 from src.schemas.models import MediaRecipeRevision
 from src.api.auth import require_owner
 from src.domain.recipe.recipe_runtime import RecipeRuntimeService
+from src.schemas.enums import AttemptStatus, NodeRunStatus, RevisionStatus, RunStatus
 
 _recipe = SqlMediaRecipeService()
 _runtime = RuntimeService(session_factory=get_session_factory())
@@ -81,6 +85,13 @@ class RecipeExecuteRequest(BaseModel):
     body: dict
     idempotency_key: str
     inputs: dict = {}
+
+
+class RecipeTrialRequest(BaseModel):
+    """Inputs for an isolated Lab run of an already frozen Recipe revision."""
+
+    inputs: dict = {}
+    idempotency_key: str
 
 
 class DryRunResponse(BaseModel):
@@ -408,35 +419,118 @@ async def execute_recipe(body: RecipeExecuteRequest, authorization: str | None =
             raise ValidationError_("AtlasCloud operator requires model_id")
         request = {"input": fixed_inputs, "parameters": external["parameters"]}
         request_hash = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        operation = {"atlas_llm": "llm", "atlas_image": "image", "atlas_video": "video"}[external["operator"]]
+        output_refs = frozen_body.get("public_output_schema_refs", [])
+        schema_ref = output_refs[0] if isinstance(output_refs, list) and output_refs else "media_output.v1"
+        schema_id, _, raw_version = str(schema_ref).rpartition(".v")
+        if not schema_id or not raw_version.isdigit():
+            raise ValidationError_("Recipe public output schema must use schema_id.vN")
         external_index = compiled["compiled_plan"]["steps"].index(external)
+        with get_session_factory()() as session:
+            child_attempt = session.get(NodeRunAttemptModel, child_attempt_ids[external_index])
+            if child_attempt is None:
+                raise NotFoundError("Recipe operator NodeRunAttempt", str(child_attempt_ids[external_index]))
+            child_epoch = int(child_attempt.execution_epoch)
         provider_attempt, dispatch = _runtime.dispatch_provider(
             child_attempt_ids[external_index], provider_id="atlascloud", model_id=model_id,
             idempotency_key=body.idempotency_key, request_body_hash=request_hash,
+            dispatch_payload={
+                "operation": operation,
+                "request": request,
+                "expected_epoch": child_epoch,
+                "result_schema": {"schema_id": schema_id, "schema_version": int(raw_version), "owner_scope": request_owner},
+                "kind": "recipe_operator",
+            },
         )
-        operation = {"atlas_llm": "llm", "atlas_image": "image", "atlas_video": "video"}[external["operator"]]
         try:
             submission = adapter.submit(operation=operation, model_id=model_id, payload=request, idempotency_key=body.idempotency_key)
         except AtlasSubmissionUnknown:
             _runtime.mark_provider_unknown(provider_attempt.provider_attempt_id)
             return {"provider_attempt_id": str(provider_attempt.provider_attempt_id), "status": "unknown", "outbox_event_id": str(dispatch.event_id), "operator_attempt_ids": [str(value) for value in child_attempt_ids]}
-        if submission.task_id:
+        if submission.asynchronous:
+            if submission.task_id is None:
+                raise ValidationError_("AtlasCloud async media submission lacks a prediction id")
             _runtime.bind_provider_task(provider_attempt.provider_attempt_id, submission.task_id)
+            return {
+                "provider_attempt_id": str(provider_attempt.provider_attempt_id),
+                "status": "submitted",
+                "provider_task_id": submission.task_id,
+                "outbox_event_id": str(dispatch.event_id),
+                "operator_attempt_ids": [str(value) for value in child_attempt_ids],
+            }
         if not submission.outputs or not all(isinstance(output, dict) for output in submission.outputs):
             _runtime.fail_attempt(body.node_run_attempt_id)
             raise ValidationError_("Recipe provider output must contain typed object results")
-        output_refs = frozen_body.get("public_output_schema_refs", [])
-        schema_ref = output_refs[0] if isinstance(output_refs, list) and output_refs else "media_output.v1"
-        schema_id, _, raw_version = str(schema_ref).rpartition(".v")
-        if not schema_id or not raw_version.isdigit():
-            _runtime.fail_attempt(body.node_run_attempt_id)
-            raise ValidationError_("Recipe public output schema must use schema_id.vN")
         owner_scope = request_owner
         record, publish, artifact_ids = _runtime.publish_provider_json_outputs(
             provider_attempt.provider_attempt_id, owner_scope=owner_scope, schema_id=schema_id,
             schema_version=int(raw_version), outputs=submission.outputs, model_version=submission.model_version,
             response_fingerprint=submission.raw_fingerprint, usage=submission.usage, actual_cost=submission.actual_cost,
+            current_epoch=child_epoch,
         )
         return {"provider_attempt_id": str(provider_attempt.provider_attempt_id), "status": "completed", "record_id": str(record.record_id),
             "artifact_version_ids": [str(value) for value in artifact_ids], "outbox_event_id": str(publish.event_id), "operator_attempt_ids": [str(value) for value in child_attempt_ids]}
     except (ValidationError_, PolicyBlockedError, ConflictError, NotFoundError, ForbiddenError) as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.to_dict())
+
+
+@router.post("/{recipe_id}/revisions/{revision_id}/trial", status_code=201)
+async def execute_recipe_trial(
+    recipe_id: UUID,
+    revision_id: UUID,
+    body: RecipeTrialRequest,
+    authorization: str | None = Header(None),
+) -> dict:
+    """Run one active Recipe revision through the production execution boundary.
+
+    The Lab has no workflow node attempt of its own.  This endpoint therefore
+    creates an owner-scoped, isolated parent attempt with the revision and
+    inputs fixed before delegating to :func:`execute_recipe`.  It deliberately
+    does not accept a Recipe body, provider/model override, or browser-created
+    graph.  Missing AtlasCloud configuration fails before this transient run
+    is materialised, matching the normal execute endpoint's no-side-effect
+    policy.
+    """
+    try:
+        owner_scope = _require_recipe_owner(recipe_id, authorization)
+        if not AtlasCloudAdapter().configured:
+            raise PolicyBlockedError("AtlasCloud 凭证未配置")
+        with get_session_factory().begin() as session:
+            revision = session.get(MediaRecipeRevisionModel, revision_id)
+            if revision is None or revision.recipe_id != recipe_id:
+                raise NotFoundError("MediaRecipeRevision", str(revision_id))
+            if revision.status != RevisionStatus.ACTIVE:
+                raise ConflictError("Recipe Lab 试跑要求已发布的固定修订")
+            now = datetime.now(timezone.utc)
+            workflow_id, workflow_revision_id, run_id, node_run_id, attempt_id = (uuid4() for _ in range(5))
+            session.add(WorkflowModel(workflow_id=workflow_id, owner_scope=owner_scope, created_at=now))
+            session.add(WorkflowRevisionModel(
+                revision_id=workflow_revision_id, workflow_id=workflow_id,
+                revision_number=1, graph_hash="recipe-lab-trial", execution_hash="recipe-lab-trial",
+                registry_snapshot_id=uuid4(),
+                graph={"nodes": [{"id": "recipe-lab-trial", "type": "media_recipe_invoke"}], "edges": []},
+                config={}, layout={}, revision_status=RevisionStatus.ACTIVE, created_at=now,
+            ))
+            session.add(WorkflowRunModel(
+                run_id=run_id, workflow_revision_id=workflow_revision_id, compiled_plan_id=uuid4(),
+                owner_scope=owner_scope, input_snapshot=dict(body.inputs), status=RunStatus.RUNNING, created_at=now,
+            ))
+            session.add(NodeRunModel(
+                node_run_id=node_run_id, run_id=run_id, node_instance_id="recipe-lab-trial",
+                node_type_id="media_recipe_invoke", status=NodeRunStatus.RUNNING,
+            ))
+            session.add(NodeRunAttemptModel(
+                attempt_id=attempt_id, node_run_id=node_run_id, attempt_number=1, execution_epoch=1,
+                fixed_input={"recipe_revision_id": str(revision_id), "recipe_inputs": dict(body.inputs), "lab_trial": True},
+                status=AttemptStatus.RUNNING,
+            ))
+        result = await execute_recipe(
+            RecipeExecuteRequest(
+                node_run_attempt_id=attempt_id, recipe_revision_id=revision_id,
+                body={}, idempotency_key=body.idempotency_key, inputs={},
+            ),
+            authorization,
+        )
+        return {**result, "run_id": str(run_id), "node_run_attempt_id": str(attempt_id), "lab_trial": True}
+    except (ValidationError_, PolicyBlockedError, ConflictError, NotFoundError, ForbiddenError) as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.to_dict()) from exc

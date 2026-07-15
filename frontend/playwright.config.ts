@@ -42,6 +42,7 @@ export default defineConfig({
         ATLASCLOUD_API_KEY: '',
         EMBEDDED_BUSINESS_WORKER_ENABLED: 'true',
         DEBUG: 'true',
+        TEMPLATE_INTERNAL_ADMIN_KEY: 'e2e-template-maintainer',
       },
     },
     {

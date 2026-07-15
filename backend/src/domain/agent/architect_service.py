@@ -16,14 +16,23 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from src.core.exceptions import ConflictError, NotFoundError, ValidationError_
-from src.infra.db.models import ArtifactVersionModel
+from src.core.exceptions import ConflictError, NotFoundError, PolicyBlockedError, ValidationError_
+from src.infra.db.models import (
+    ArtifactVersionModel,
+    NodeRunAttemptModel,
+    NodeRunModel,
+    WorkflowModel,
+    WorkflowRevisionModel,
+    WorkflowRunModel,
+)
 from src.infra.db.session import get_session_factory
 from src.domain.workflow.sql_workflow_service import SqlWorkflowService
 from src.infra.db.agent_repository import SqlAgentRepository
 from src.domain.agent.invocation_service import AgentInvocationService
+from src.domain.provider.atlascloud import AtlasCloudAdapter
 from src.domain.workflow.compiler import CompilationError, WorkflowCompiler
 from src.infra.db.registry_repository import SqlRegistryService
+from src.schemas.enums import AttemptStatus, NodeRunStatus, RevisionStatus, RunStatus
 from src.schemas.models import OwnerScope
 from src.domain.agent.architect_policy_service import ArchitectPolicyService
 
@@ -90,6 +99,73 @@ class ArchitectService:
             base_draft_hash=base_draft_hash, intent=intent, operations=operations,
             provenance={"agent_revision_id": str(revision), "agent_artifact_version_id": str(artifact_id)},
             input_snapshot=input_snapshot)
+
+    def generate_from_intent(
+        self, *, workflow_id: UUID, owner_scope: str, base_draft_hash: str, intent: str,
+    ) -> dict[str, Any]:
+        """Create a server-owned isolated Architect attempt for a canvas intent.
+
+        The browser supplies no graph operation and no runtime identity.  The
+        ephemeral run is deliberately separate from the edited workflow, while
+        retaining a normal durable Run/NodeRun/Attempt audit trail.
+        """
+        if not intent.strip() or len(intent) > 8_000:
+            raise ValidationError_("Architect intent must contain 1-8000 characters")
+        # Refuse before materialising the isolated run.  The normal service
+        # uses AtlasCloudAdapter; tests may inject an explicitly configured
+        # fake adapter through AgentInvocationService.
+        adapter = getattr(self._invocations, "_adapter", None) if self._invocations else None
+        if not (adapter or AtlasCloudAdapter()).configured:
+            raise PolicyBlockedError("AtlasCloud 凭证未配置")
+        workflow = self._workflows.get_workflow(workflow_id)
+        if workflow.owner_scope.scoped_id != owner_scope:
+            raise ValidationError_("Only the workflow owner may create Architect proposals")
+        draft = self._workflows.get_draft(workflow_id)
+        if draft.graph_hash != base_draft_hash:
+            raise ConflictError("Architect proposal base_draft_hash is stale")
+        run_id, revision_id, attempt_id = uuid4(), uuid4(), uuid4()
+        node_id = uuid4()
+        now = datetime.now(timezone.utc)
+        with self._factory.begin() as session:
+            isolated_workflow_id = uuid4()
+            session.add(WorkflowModel(workflow_id=isolated_workflow_id, owner_scope=owner_scope, created_at=now))
+            session.flush()
+            session.add(WorkflowRevisionModel(
+                revision_id=revision_id, workflow_id=isolated_workflow_id, revision_number=1,
+                graph_hash="architect-intent", execution_hash="architect-intent",
+                registry_snapshot_id=uuid4(),
+                graph={"nodes": [{"id": "architect", "type": "agent_invoke"}], "edges": []},
+                config={"source_workflow_id": str(workflow_id)}, layout={},
+                revision_status=RevisionStatus.ACTIVE, created_at=now,
+            ))
+            session.flush()
+            session.add(WorkflowRunModel(
+                run_id=run_id, workflow_revision_id=revision_id, compiled_plan_id=uuid4(),
+                owner_scope=owner_scope,
+                input_snapshot={"architect_source_workflow_id": str(workflow_id), "base_draft_hash": base_draft_hash},
+                status=RunStatus.RUNNING, created_at=now,
+            ))
+            session.flush()
+            session.add(NodeRunModel(
+                node_run_id=node_id, run_id=run_id, node_instance_id="architect",
+                node_type_id="agent_invoke", status=NodeRunStatus.RUNNING,
+            ))
+            # The attempt has a direct FK to NodeRun.  Flush the transient
+            # workflow/run/node chain before adding it; SQLAlchemy has no ORM
+            # relationship metadata to infer this ordering from UUID fields.
+            session.flush()
+            session.add(NodeRunAttemptModel(
+                attempt_id=attempt_id, node_run_id=node_id, attempt_number=1,
+                execution_epoch=1, status=AttemptStatus.RUNNING,
+                fixed_input={"architect_source_workflow_id": str(workflow_id), "base_draft_hash": base_draft_hash},
+                started_at=now,
+            ))
+        result = self.generate(
+            workflow_id=workflow_id, owner_scope=owner_scope,
+            base_draft_hash=base_draft_hash, intent=intent.strip(),
+            node_run_attempt_id=attempt_id,
+        )
+        return {**result, "runtime_run_id": str(run_id), "runtime_attempt_id": str(attempt_id)}
 
     @staticmethod
     def _architect_input_snapshot(*, workflow_id: UUID, base_draft_hash: str, intent: str, draft_graph: dict[str, Any], registry: Any) -> dict[str, Any]:

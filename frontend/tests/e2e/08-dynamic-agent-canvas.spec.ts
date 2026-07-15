@@ -1,18 +1,8 @@
 import { test, expect } from '@playwright/test'
+import { loginWithFreshAccount } from './auth'
 
 async function login(page: any) {
-  await page.goto('/login')
-  await page.waitForSelector('.login-card', { timeout: 15000 })
-  const email = `agents-${Date.now()}-${Math.random().toString(36).slice(2, 6)}@toonflow.local`
-  const bootstrap = page.locator('button:has-text("初始化")')
-  if (await bootstrap.isVisible({ timeout: 2000 }).catch(() => false)) {
-    await page.fill('input[type="email"]', email); await page.fill('input[type="text"]', 'Agents'); await page.fill('input[type="password"]', 'password'); await bootstrap.click()
-  }
-  await page.fill('input[type="email"]', email)
-  if (await page.locator('input[type="text"]').isVisible({ timeout: 1000 }).catch(() => false)) await page.fill('input[type="text"]', 'Agents')
-  await page.fill('input[type="password"]', 'password')
-  await page.locator('button:has-text("登录")').click()
-  await page.waitForURL('**/projects', { timeout: 15000 })
+  await loginWithFreshAccount(page, 'agents', 'Agents')
 }
 
 async function connect(page: any, source: any, target: any) {
@@ -48,6 +38,7 @@ test('published Agent revision appears in canvas and three fixed nodes compile a
   await page.goto(`/projects/${projectId}`)
   await page.click('button:has-text("新建工作流")')
   await page.waitForURL('**/canvas?workflow_id=*', { timeout: 15000 })
+  await expect(page.getByTestId('workflow-canvas')).toHaveAttribute('aria-busy', 'false', { timeout: 10000 })
   await expect(page.locator('.palette-item', { hasText: agentName })).toBeVisible({ timeout: 10000 })
   const agentPalette = page.locator('.palette-item', { hasText: agentName })
   await agentPalette.click(); await agentPalette.click(); await agentPalette.click()
@@ -55,9 +46,16 @@ test('published Agent revision appears in canvas and three fixed nodes compile a
   await expect(agentNodes).toHaveCount(3)
   const first = agentNodes.nth(0); const second = agentNodes.nth(1); const third = agentNodes.nth(2)
   await connect(page, first, second); await connect(page, second, third)
-  await page.click('button:has-text("保存")')
-  await page.click('button:has-text("编译")')
-  await expect(page.locator('.compile-panel')).toContainText('编译通过', { timeout: 10000 })
+  await Promise.all([
+    page.waitForResponse((response) => response.request().method() === 'PUT'
+      && /\/api\/v1\/workflows\/[^/]+\/draft$/.test(response.url())
+      && response.status() === 200),
+    page.getByRole('button', { name: '保存', exact: true }).click(),
+  ])
+  await page.getByTestId('workflow-compile').click()
+  // Compilation reads the persisted registry snapshot before responding; the
+  // E2E database contains the full catalog, so this is not a UI animation wait.
+  await expect(page.getByTestId('compile-result')).toContainText('编译通过', { timeout: 30_000 })
   await page.click('button:has-text("发布并运行")')
   // With no AtlasCloud credentials, dispatch is visibly blocked at execution;
   // publishing itself must succeed and preserve the fixed Agent revisions.

@@ -16,6 +16,11 @@ from src.infra.db.identity_repository import get_session_store
 from src.infra.db.template_repository import SqlTemplateService
 from src.schemas.enums import DependencyKind
 from src.schemas.models import OwnerScope
+from src.core.config import settings
+import hmac
+from sqlalchemy import select
+from src.infra.db.models import ResourceModel, ResourceRevisionModel, WorkflowModel, WorkflowRevisionModel
+from src.infra.db.session import get_session_factory
 
 router = APIRouter(prefix="/api/v1/templates", tags=["template"])
 
@@ -154,6 +159,12 @@ def _safe_error_response(exc: SafeError) -> HTTPException:
     return HTTPException(status_code=exc.status_code, detail=payload)
 
 
+def _require_template_maintainer(key: str | None) -> None:
+    """Fail closed: official template mutation belongs to the platform."""
+    if not settings.template_internal_admin_key or not key or not hmac.compare_digest(key, settings.template_internal_admin_key):
+        raise HTTPException(status_code=403, detail="Template maintainer credential required")
+
+
 def _manifest_from_def(defn: ManifestDef) -> WorkflowPackageManifest:
     deps = [
         PackageDependency(
@@ -195,9 +206,10 @@ def _manifest_from_def(defn: ManifestDef) -> WorkflowPackageManifest:
 
 
 @router.post("", status_code=201)
-async def create_template(body: CreateTemplateRequest, authorization: str | None = Header(None)):
+async def create_template(body: CreateTemplateRequest, authorization: str | None = Header(None), x_template_admin_key: str | None = Header(None)):
     """Create a new template (platform operation)."""
     try:
+        _require_template_maintainer(x_template_admin_key)
         _, owner = _resolve_owner(authorization)
         template_id = _template_service.create_template(
             name=body.name,
@@ -217,7 +229,8 @@ async def create_template(body: CreateTemplateRequest, authorization: str | None
 
 
 @router.post("/benchmarks/seed", status_code=201)
-async def seed_benchmark_templates(authorization: str | None = Header(None)) -> dict[str, list[str]]:
+async def seed_benchmark_templates(authorization: str | None = Header(None), x_template_admin_key: str | None = Header(None)) -> dict[str, list[str]]:
+    _require_template_maintainer(x_template_admin_key)
     _, owner = _resolve_owner(authorization)
     return {"template_ids": _template_service.seed_benchmark_templates(owner)}
 
@@ -228,6 +241,29 @@ async def list_templates(authorization: str | None = Header(None)):
     _, owner = _resolve_owner(authorization)
     templates = _template_service.list_templates(owner)
     return [TemplateSummary(**t) for t in templates]
+
+
+@router.get("/{template_id}/replacement-options")
+async def replacement_options(template_id: str, authorization: str | None = Header(None)) -> dict[str, Any]:
+    """Owner-scoped immutable revision choices for typed replacement slots."""
+    _, owner = _resolve_owner(authorization)
+    template = _template_service.get_template(template_id, owner)
+    slots: list[dict[str, Any]] = []
+    with get_session_factory()() as session:
+        for slot in template.manifest.replacement_slots:
+            candidates: list[dict[str, str]] = []
+            if slot.expected_kind == DependencyKind.RESOURCE:
+                rows = session.execute(select(ResourceRevisionModel, ResourceModel).join(
+                    ResourceModel, ResourceModel.resource_id == ResourceRevisionModel.resource_id,
+                ).where(ResourceModel.owner_scope == owner.scoped_id)).all()
+                candidates = [{"revision_id": str(revision.revision_id), "label": f"{resource.resource_type} · r{revision.revision_number}"} for revision, resource in rows]
+            elif slot.expected_kind == DependencyKind.WORKFLOW:
+                rows = session.execute(select(WorkflowRevisionModel, WorkflowModel).join(
+                    WorkflowModel, WorkflowModel.workflow_id == WorkflowRevisionModel.workflow_id,
+                ).where(WorkflowModel.owner_scope == owner.scoped_id, WorkflowRevisionModel.revision_status == "active")).all()
+                candidates = [{"revision_id": str(revision.revision_id), "label": f"Workflow · r{revision.revision_number}"} for revision, _workflow in rows]
+            slots.append({"slot_id": slot.slot_id, "expected_kind": slot.expected_kind.value, "candidates": candidates})
+    return {"slots": slots}
 
 
 @router.get("/{template_id}")

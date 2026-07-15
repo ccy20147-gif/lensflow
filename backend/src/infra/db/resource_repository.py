@@ -23,6 +23,12 @@ from src.schemas.enums import RevisionStatus
 from src.schemas.models import OwnerScope, Resource, ResourceDraft, ResourceRef, ResourceRevision
 
 
+KNOWN_RESOURCE_TYPES = frozenset({
+    "world", "character", "shot_plan", "shot_spec", "creative_work",
+    "agent", "recipe", "skill", "creative_board", "generic",
+})
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
@@ -103,6 +109,8 @@ class SqlResourceRepository:
         source_local_id: str | None = None,
         elevation_event_id: UUID | None = None,
     ) -> Resource:
+        if resource_type not in KNOWN_RESOURCE_TYPES:
+            raise ValidationError_("Resource 必须使用已注册的资源类型")
         with self._factory.begin() as session:
             artifact = session.get(ArtifactVersionModel, content_artifact_version_id)
             if artifact is None or artifact.owner_scope != owner.scoped_id:
@@ -293,6 +301,16 @@ class SqlResourceRepository:
             )
             session.add(row)
             draft.base_revision_id = row.revision_id
+            # A new immutable revision makes drafts that still explicitly
+            # track this Resource's earlier revision stale. Historical runs
+            # and immutable workflow revisions are deliberately untouched.
+            if previous is not None:
+                stale = {"resource_id": str(resource_id), "superseded_revision_id": str(previous.revision_id), "current_revision_id": str(row.revision_id)}
+                for candidate in session.scalars(select(ResourceDraftModel).where(
+                    ResourceDraftModel.resource_id != resource_id,
+                    ResourceDraftModel.base_revision_id == previous.revision_id,
+                )):
+                    candidate.stale_reason = stale
             session.flush()
             return _revision(row)
 

@@ -18,6 +18,7 @@ from src.infra.db.models import (
     NodeRunModel,
     ProviderInvocationRecordModel,
     ProviderOutputBindingModel,
+    WorkflowTaskBindingModel,
     ProviderInvocationAttemptModel,
     WorkflowRevisionModel,
     WorkflowRunModel,
@@ -116,6 +117,41 @@ def test_external_unknown_does_not_blind_retry(factory):
         assert len(rows) == 1 and rows[0].status == AttemptStatus.UNKNOWN
 
 
+def test_media_submission_binds_async_task_without_publishing_output(factory):
+    parent = _parent(factory)
+    service = RecipeRuntimeService(factory)
+    body = {"recipe_type": "image", "operator_graph": {
+        "generate": {"type": "atlas_image", "model_id": "seedream-3.0", "inputs": []},
+    }}
+    child = service.materialize(parent_attempt_id=parent, body=body, inputs={})[0]
+
+    task_id = f"recipe-prediction-{uuid4()}"
+
+    class Accepted:
+        def request(self, method: str, url: str, **_kwargs: object) -> httpx.Response:
+            return httpx.Response(200, request=httpx.Request(method, url), json={
+                    "code": 200, "data": {"id": task_id},
+            })
+
+    result = service.dispatch_external(
+        child, adapter=AtlasCloudAdapter(transport=Accepted(), api_key="key", base_url="https://atlas.test"),
+        idempotency_key=f"accepted-{uuid4()}",
+    )
+    assert result["status"] == "submitted"
+    with factory() as session:
+        provider = session.scalar(select(ProviderInvocationAttemptModel).where(
+            ProviderInvocationAttemptModel.node_run_attempt_id == child,
+        ))
+        binding = session.scalar(select(WorkflowTaskBindingModel).where(
+            WorkflowTaskBindingModel.provider_attempt_id == provider.provider_attempt_id,
+        )) if provider is not None else None
+        assert provider is not None and binding is not None
+        assert binding.provider_task_id == task_id
+        assert session.scalar(select(ProviderInvocationRecordModel).where(
+            ProviderInvocationRecordModel.provider_attempt_id == provider.provider_attempt_id,
+        )) is None
+
+
 def test_all_internal_operators_aggregate_parent(factory):
     parent = _parent(factory)
     service = RecipeRuntimeService(factory)
@@ -169,6 +205,39 @@ def test_fallback_never_retries_an_unreconciled_unknown(factory):
         session.get(NodeRunAttemptModel, child).status = AttemptStatus.UNKNOWN
     with pytest.raises(Exception, match="reconciliation"):
         service.fallback_attempt(child)
+
+
+def test_fallback_refreezes_capability_authorization_cost_and_dispatches_new_attempt(factory):
+    """WF-006 AC-10: fallback is a new externally auditable request."""
+    parent = _parent(factory)
+    service = RecipeRuntimeService(factory)
+    body = {"recipe_type": "image", "operator_graph": {
+        "generate": {
+            "type": "atlas_image", "model_id": "atlas/image-v2",
+            "parameters": {"estimated_cost": 0.42},
+            "required_controls": ["pose"], "supported_controls": ["pose"],
+        },
+    }}
+    original = service.materialize(parent_attempt_id=parent, body=body, inputs={})[0]
+    service.fail_child(original, policy="collect_errors")
+    replacement = service.fallback_attempt(original)
+    runtime = RuntimeService(factory)
+    provider, event = runtime.dispatch_provider(
+        replacement, provider_id="atlascloud", model_id="atlas/image-v2",
+        idempotency_key=f"fallback-{uuid4()}", request_body_hash="fallback",
+    )
+    with factory() as session:
+        old = session.get(NodeRunAttemptModel, original)
+        new = session.get(NodeRunAttemptModel, replacement)
+        invocation = session.get(ProviderInvocationAttemptModel, provider.provider_attempt_id)
+        assert old is not None and old.status == AttemptStatus.FAILED
+        assert new is not None and new.execution_epoch == old.execution_epoch + 1
+        audit = new.fixed_input["fallback_recheck"]
+        assert audit["capability_snapshot"] == {"provider": "atlascloud", "controls": ["pose"]}
+        assert audit["authorization_decision"]["allowed"] is True
+        assert audit["cost_estimate"] == 0.42
+        assert invocation is not None and invocation.node_run_attempt_id == replacement
+        assert event.purpose == "provider_dispatch" and event.aggregate_id == provider.provider_attempt_id
 
 
 def test_parallel_external_multi_output_children_converge_deterministically(factory):

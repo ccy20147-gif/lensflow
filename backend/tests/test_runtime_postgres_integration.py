@@ -15,6 +15,7 @@ from sqlalchemy import func, select
 
 from src.domain.runtime.runtime_service import RuntimeService
 from src.domain.runtime.worker import RuntimeWorker
+from src.domain.provider.atlascloud import AtlasSubmission, AtlasSubmissionUnknown
 from src.infra.db.models import (
     ArtifactVersionModel,
     CompiledExecutionPlanModel,
@@ -36,7 +37,7 @@ from src.infra.db.models import (
     WorkflowRevisionModel,
 )
 from src.infra.db.session import get_session_factory
-from src.schemas.enums import AttemptStatus, NodeRunStatus, RevisionStatus
+from src.schemas.enums import AttemptStatus, NodeRunStatus, RevisionStatus, RunStatus
 from src.schemas.models import CompiledExecutionPlan, OwnerScope, RegistrySnapshot
 
 
@@ -206,7 +207,7 @@ def test_expired_waiting_external_submission_becomes_unknown_without_new_dispatc
         assert reconcile is not None
 
 
-def test_unknown_atlas_task_reconciles_and_duplicate_callback_is_idempotent() -> None:
+def test_waiting_external_atlas_task_is_polled_and_duplicate_callback_is_idempotent() -> None:
     factory = get_session_factory()
     workflow_id, revision_id = uuid.uuid4(), uuid.uuid4()
     owner_id = uuid.uuid4()
@@ -227,7 +228,6 @@ def test_unknown_atlas_task_reconciles_and_duplicate_callback_is_idempotent() ->
     provider, _ = runtime.dispatch_provider(attempt.attempt_id, provider_id="atlascloud", model_id="m", idempotency_key=str(uuid.uuid4()), request_body_hash="h")
     task_id = f"atlas-{uuid.uuid4()}"
     runtime.bind_provider_task(provider.provider_attempt_id, task_id)
-    runtime.mark_provider_unknown(provider.provider_attempt_id)
 
     class FakeAtlas:
         def get_prediction(self, requested_task_id: str) -> dict:
@@ -597,3 +597,267 @@ def test_provider_dispatch_outbox_requires_submission_proof_and_is_idempotent() 
         assert attempt_row is not None and attempt_row.status == AttemptStatus.UNKNOWN
         assert len(reconciliation) == 1
         assert len(dispatches) == 1
+
+
+def test_dispatch_outbox_recovers_frozen_contract_and_unknown_without_task_is_durable() -> None:
+    """A crash before send reuses the committed idempotency key; an ambiguous
+    send without a prediction id stays in a durable manual reconciliation queue.
+    """
+    factory = get_session_factory()
+    workflow_id, revision_id, owner_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    with factory.begin() as session:
+        session.add(WorkflowModel(workflow_id=workflow_id, owner_scope=f"user:{owner_id}"))
+        session.add(WorkflowRevisionModel(
+            revision_id=revision_id, workflow_id=workflow_id, revision_number=1,
+            graph_hash="recover-send", execution_hash="recover-send", registry_snapshot_id=uuid.uuid4(),
+            revision_status=RevisionStatus.ACTIVE,
+        ))
+    runtime = RuntimeService(factory)
+    run = runtime.create_run(compiled_plan=_plan(revision_id), owner_scope=OwnerScope(kind="user", id=owner_id))
+    with factory() as session:
+        attempt = session.scalar(select(NodeRunAttemptModel).join(NodeRunModel).where(NodeRunModel.run_id == run.run_id))
+        assert attempt is not None
+        epoch = attempt.execution_epoch
+    provider, event = runtime.dispatch_provider(
+        attempt.attempt_id, provider_id="atlascloud", model_id="atlas-test",
+        idempotency_key=f"recoverable-{uuid.uuid4()}", request_body_hash="frozen",
+        dispatch_payload={
+            "operation": "llm", "request": {"messages": [{"role": "user", "content": "fixed"}]},
+            "expected_epoch": epoch,
+            "result_schema": {"schema_id": "test_output", "schema_version": 1, "owner_scope": f"user:{owner_id}"},
+        },
+    )
+
+    class Success:
+        def __init__(self) -> None:
+            self.keys: list[str] = []
+
+        def submit(self, *, operation: str, model_id: str, payload: dict, idempotency_key: str) -> AtlasSubmission:
+            self.keys.append(idempotency_key)
+            assert operation == "llm" and model_id == "atlas-test"
+            assert payload == {"messages": [{"role": "user", "content": "fixed"}]}
+            return AtlasSubmission(task_id=None, model_version="atlas-test-v1", outputs=[{"text": "done"}], usage={}, actual_cost=0.1, raw_fingerprint="recover")
+
+    adapter = Success()
+    assert RuntimeWorker(factory).consume_provider_dispatch_outbox(adapter=adapter) == {"published": 1, "unknown": 0}
+    assert adapter.keys == [provider.idempotency_key]
+    with factory() as session:
+        assert session.get(OutboxEventModel, event.event_id).published_at is not None
+        assert session.scalar(select(ProviderInvocationRecordModel).where(ProviderInvocationRecordModel.provider_attempt_id == provider.provider_attempt_id)) is not None
+
+    # An uncertain network result has no provider task id. It is intentionally
+    # never polled/re-sent, but remains queryable as a pending reconciliation.
+    second = runtime.create_run(compiled_plan=_plan(revision_id), owner_scope=OwnerScope(kind="user", id=owner_id))
+    with factory() as session:
+        unknown_attempt = session.scalar(select(NodeRunAttemptModel).join(NodeRunModel).where(NodeRunModel.run_id == second.run_id))
+        assert unknown_attempt is not None
+    unknown_provider, _ = runtime.dispatch_provider(
+        unknown_attempt.attempt_id, provider_id="atlascloud", model_id="atlas-test",
+        idempotency_key=f"ambiguous-{uuid.uuid4()}", request_body_hash="frozen-unknown",
+        dispatch_payload={
+            "operation": "llm", "request": {"messages": []}, "expected_epoch": unknown_attempt.execution_epoch,
+            "result_schema": {"schema_id": "test_output", "schema_version": 1, "owner_scope": f"user:{owner_id}"},
+        },
+    )
+
+    class Unknown:
+        def submit(self, **_kwargs: object) -> AtlasSubmission:
+            raise AtlasSubmissionUnknown()
+
+    worker = RuntimeWorker(factory)
+    assert worker.consume_provider_dispatch_outbox(adapter=Unknown()) == {"published": 0, "unknown": 1}
+    report = worker.reconcile_unknown(adapter=Success())  # type: ignore[arg-type]
+    assert report.pending >= 1
+    with factory() as session:
+        persisted = session.get(ProviderInvocationAttemptModel, unknown_provider.provider_attempt_id)
+        queue = session.scalar(select(OutboxEventModel).where(
+            OutboxEventModel.aggregate_id == unknown_provider.provider_attempt_id,
+            OutboxEventModel.purpose == "provider_reconcile",
+            OutboxEventModel.published_at.is_(None),
+        ))
+        assert persisted is not None and persisted.status == AttemptStatus.UNKNOWN
+        assert queue is not None
+
+
+def test_dispatch_outbox_fences_late_result_for_superseded_epoch() -> None:
+    factory = get_session_factory()
+    workflow_id, revision_id, owner_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    with factory.begin() as session:
+        session.add(WorkflowModel(workflow_id=workflow_id, owner_scope=f"user:{owner_id}"))
+        session.add(WorkflowRevisionModel(
+            revision_id=revision_id, workflow_id=workflow_id, revision_number=1,
+            graph_hash="late", execution_hash="late", registry_snapshot_id=uuid.uuid4(), revision_status=RevisionStatus.ACTIVE,
+        ))
+    runtime = RuntimeService(factory)
+    run = runtime.create_run(compiled_plan=_plan(revision_id), owner_scope=OwnerScope(kind="user", id=owner_id))
+    with factory() as session:
+        old = session.scalar(select(NodeRunAttemptModel).join(NodeRunModel).where(NodeRunModel.run_id == run.run_id))
+        assert old is not None
+    provider, event = runtime.dispatch_provider(
+        old.attempt_id, provider_id="atlascloud", model_id="atlas-test", idempotency_key=f"late-{uuid.uuid4()}", request_body_hash="late",
+        dispatch_payload={"operation": "llm", "request": {"messages": []}, "expected_epoch": old.execution_epoch,
+                          "result_schema": {"schema_id": "test_output", "schema_version": 1, "owner_scope": f"user:{owner_id}"}},
+    )
+    replacement = runtime.create_attempt(old.node_run_id)
+
+    class Late:
+        def submit(self, **_kwargs: object) -> AtlasSubmission:
+            return AtlasSubmission(task_id=None, model_version="late", outputs=[{"text": "late"}], usage={}, actual_cost=0, raw_fingerprint="late")
+
+    # The stale event is acknowledged without any provider submit; its epoch
+    # fence was committed before the worker acquired the send lease.
+    assert RuntimeWorker(factory).consume_provider_dispatch_outbox(adapter=Late()) == {"published": 1, "unknown": 0}
+    with factory() as session:
+        old_row = session.get(NodeRunAttemptModel, old.attempt_id)
+        new_row = session.get(NodeRunAttemptModel, replacement.attempt_id)
+        provider_row = session.get(ProviderInvocationAttemptModel, provider.provider_attempt_id)
+        assert old_row is not None and old_row.status == AttemptStatus.SUPERSEDED
+        assert new_row is not None and new_row.execution_epoch == old.execution_epoch + 1
+        assert provider_row is not None and provider_row.status == AttemptStatus.SUPERSEDED
+        assert session.get(OutboxEventModel, event.event_id).published_at is not None
+        assert session.scalar(select(ProviderInvocationRecordModel).where(ProviderInvocationRecordModel.provider_attempt_id == provider.provider_attempt_id)) is None
+
+
+def test_cancellation_fences_late_provider_result_and_downstream_scheduling() -> None:
+    """AC-4: cancellation is a durable fence, not a UI-only state change."""
+    factory = get_session_factory()
+    workflow_id, revision_id, owner_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    graph = {
+        "nodes": [{"id": "source", "type": "provider"}, {"id": "next", "type": "provider"}],
+        "edges": [{"source": "source", "target": "next"}],
+    }
+    with factory.begin() as session:
+        session.add(WorkflowModel(workflow_id=workflow_id, owner_scope=f"user:{owner_id}"))
+        session.add(WorkflowRevisionModel(
+            revision_id=revision_id, workflow_id=workflow_id, revision_number=1,
+            graph=graph, graph_hash="cancel", execution_hash="cancel",
+            registry_snapshot_id=uuid.uuid4(), revision_status=RevisionStatus.ACTIVE,
+        ))
+    plan = CompiledExecutionPlan(
+        plan_id=uuid.uuid4(), workflow_revision_id=revision_id,
+        registry_snapshot=RegistrySnapshot(snapshot_id=uuid.uuid4()), resolved_graph=graph,
+        plan_hash="cancel-fence",
+    )
+    runtime = RuntimeService(factory)
+    run = runtime.create_run(compiled_plan=plan, owner_scope=OwnerScope(kind="user", id=owner_id))
+    runtime.start_run(run.run_id)
+    with factory() as session:
+        source = session.scalar(select(NodeRunModel).where(
+            NodeRunModel.run_id == run.run_id, NodeRunModel.node_instance_id == "source",
+        ))
+        assert source is not None
+        attempt = session.scalar(select(NodeRunAttemptModel).where(NodeRunAttemptModel.node_run_id == source.node_run_id))
+        assert attempt is not None
+    provider, _ = runtime.dispatch_provider(
+        attempt.attempt_id, provider_id="atlascloud", model_id="m",
+        idempotency_key=f"cancel-{uuid.uuid4()}", request_body_hash="cancel",
+    )
+    artifact_id = uuid.uuid4()
+    with factory.begin() as session:
+        session.add(ArtifactVersionModel(artifact_version_id=artifact_id, owner_scope=f"user:{owner_id}"))
+    runtime.cancel_run(run.run_id)
+    with pytest.raises(Exception, match="Cancelled or superseded"):
+        runtime.dispatch_provider(
+            attempt.attempt_id, provider_id="atlascloud", model_id="m",
+            idempotency_key=f"post-cancel-{uuid.uuid4()}", request_body_hash="late-dispatch",
+        )
+    with pytest.raises(Exception, match="Cancelled or superseded"):
+        runtime.record_provider_result(
+            provider.provider_attempt_id, model_version="m", response_fingerprint="late",
+            output_artifact_version_ids=[artifact_id], current_epoch=attempt.execution_epoch,
+        )
+    with factory() as session:
+        persisted_run = session.get(WorkflowRunModel, run.run_id)
+        persisted_provider = session.get(ProviderInvocationAttemptModel, provider.provider_attempt_id)
+        next_node = session.scalar(select(NodeRunModel).where(
+            NodeRunModel.run_id == run.run_id, NodeRunModel.node_instance_id == "next",
+        ))
+        records = session.scalar(select(func.count()).select_from(ProviderInvocationRecordModel).where(
+            ProviderInvocationRecordModel.provider_attempt_id == provider.provider_attempt_id,
+        ))
+        assert persisted_run is not None and persisted_run.status == RunStatus.CANCELLED
+        assert persisted_provider is not None and persisted_provider.status == AttemptStatus.CANCELLED
+        assert next_node is not None and next_node.status == NodeRunStatus.CANCELLED
+        assert records == 0
+
+
+def test_retry_reuses_fixed_input_supersedes_old_epoch_and_latest_is_a_slice() -> None:
+    """AC-2/AC-5: retry preserves inputs; changed inputs require another run."""
+    factory = get_session_factory()
+    workflow_id, revision_id, owner_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    with factory.begin() as session:
+        session.add(WorkflowModel(workflow_id=workflow_id, owner_scope=f"user:{owner_id}"))
+        session.add(WorkflowRevisionModel(
+            revision_id=revision_id, workflow_id=workflow_id, revision_number=1,
+            graph_hash="retry", execution_hash="retry", registry_snapshot_id=uuid.uuid4(),
+            revision_status=RevisionStatus.ACTIVE,
+        ))
+    runtime = RuntimeService(factory)
+    run = runtime.create_run(
+        compiled_plan=_plan(revision_id), owner_scope=OwnerScope(kind="user", id=owner_id),
+        input_snapshot={"prompt": "fixed-v1"},
+    )
+    runtime.start_run(run.run_id)
+    with factory() as session:
+        node = session.scalar(select(NodeRunModel).where(NodeRunModel.run_id == run.run_id))
+        assert node is not None
+        old = session.scalar(select(NodeRunAttemptModel).where(NodeRunAttemptModel.node_run_id == node.node_run_id))
+        assert old is not None
+        old_input = dict(old.fixed_input or {})
+    retry = runtime.create_attempt(node.node_run_id)
+    with factory() as session:
+        old_row = session.get(NodeRunAttemptModel, old.attempt_id)
+        retry_row = session.get(NodeRunAttemptModel, retry.attempt_id)
+        assert old_row is not None and old_row.status == AttemptStatus.SUPERSEDED
+        assert retry_row is not None and retry_row.fixed_input == old_input
+        assert retry_row.execution_epoch == old.execution_epoch + 1
+        assert session.get(WorkflowRunModel, run.run_id).input_snapshot == {"prompt": "fixed-v1"}
+
+
+def test_result_outbox_failure_is_retried_without_duplicate_business_record() -> None:
+    """AC-6: failed delivery retains the committed result event for recovery."""
+    factory = get_session_factory()
+    workflow_id, revision_id, owner_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    with factory.begin() as session:
+        session.add(WorkflowModel(workflow_id=workflow_id, owner_scope=f"user:{owner_id}"))
+        session.add(WorkflowRevisionModel(
+            revision_id=revision_id, workflow_id=workflow_id, revision_number=1,
+            graph_hash="outbox", execution_hash="outbox", registry_snapshot_id=uuid.uuid4(),
+            revision_status=RevisionStatus.ACTIVE,
+        ))
+    runtime = RuntimeService(factory)
+    run = runtime.create_run(compiled_plan=_plan(revision_id), owner_scope=OwnerScope(kind="user", id=owner_id))
+    with factory() as session:
+        attempt = session.scalar(select(NodeRunAttemptModel).join(NodeRunModel).where(NodeRunModel.run_id == run.run_id))
+        assert attempt is not None
+    provider, _ = runtime.dispatch_provider(
+        attempt.attempt_id, provider_id="atlascloud", model_id="m",
+        idempotency_key=f"outbox-{uuid.uuid4()}", request_body_hash="outbox",
+    )
+    artifact_id = uuid.uuid4()
+    with factory.begin() as session:
+        session.add(ArtifactVersionModel(artifact_version_id=artifact_id, owner_scope=f"user:{owner_id}"))
+    record, event = runtime.record_provider_result(
+        provider.provider_attempt_id, model_version="m", response_fingerprint="result",
+        output_artifact_version_ids=[artifact_id], current_epoch=attempt.execution_epoch,
+    )
+    worker = RuntimeWorker(factory)
+    first = worker.deliver_outbox(
+        lambda _event: (_ for _ in ()).throw(RuntimeError("broker unavailable")),
+        purposes={"result_publish"}, event_ids={event.event_id},
+    )
+    assert first == {"delivered": 0, "failed": 1}
+    delivered: list[uuid.UUID] = []
+    second = worker.deliver_outbox(
+        lambda outbox: delivered.append(outbox.event_id), purposes={"result_publish"},
+        event_ids={event.event_id},
+    )
+    assert second == {"delivered": 1, "failed": 0}
+    with factory() as session:
+        persisted_event = session.get(OutboxEventModel, event.event_id)
+        records = session.scalar(select(func.count()).select_from(ProviderInvocationRecordModel).where(
+            ProviderInvocationRecordModel.provider_attempt_id == provider.provider_attempt_id,
+        ))
+        assert persisted_event is not None and persisted_event.published_at is not None and persisted_event.retry_count == 1
+        assert delivered == [event.event_id]
+        assert records == 1 and record.record_id is not None

@@ -1,23 +1,8 @@
 import { expect, test } from '@playwright/test'
+import { loginWithFreshAccount } from './auth'
 
 async function login(page: any) {
-  await page.goto('/login')
-  await page.waitForSelector('.login-card')
-  const email = `request-input-${Date.now()}-${Math.random().toString(36).slice(2, 6)}@toonflow.local`
-  const bootstrap = page.locator('button:has-text("初始化")')
-  if (await bootstrap.isVisible({ timeout: 2_000 }).catch(() => false)) {
-    await page.fill('input[type="email"]', email)
-    await page.fill('input[type="text"]', 'Request Input')
-    await page.fill('input[type="password"]', 'password')
-    await bootstrap.click()
-  }
-  await page.fill('input[type="email"]', email)
-  if (await page.locator('input[type="text"]').isVisible({ timeout: 1_000 }).catch(() => false)) await page.fill('input[type="text"]', 'Request Input')
-  await page.fill('input[type="password"]', 'password')
-  const signIn = page.locator('button:has-text("登录")')
-  if (await signIn.isVisible({ timeout: 2_000 }).catch(() => false)) await signIn.click()
-  else await page.locator('button[type="submit"]').click()
-  await page.waitForURL('**/projects')
+  await loginWithFreshAccount(page, 'request-input', 'Request Input')
 }
 
 test('RequestInput: create → typed submit → reload persists', async ({ page }) => {

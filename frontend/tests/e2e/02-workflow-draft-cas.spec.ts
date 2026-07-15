@@ -1,29 +1,8 @@
 import { test, expect } from '@playwright/test'
+import { loginWithFreshAccount } from './auth'
 
 async function login(page: any) {
-  await page.goto('/login')
-  await page.waitForSelector('.login-card', { timeout: 15000 })
-  const email = `e2e-${Date.now()}-${Math.random().toString(36).slice(2, 6)}@toonflow.local`
-  const bootstrapBtn = page.locator('button:has-text("初始化")')
-  if (await bootstrapBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-    await page.fill('input[type="email"]', email)
-    await page.fill('input[type="text"]', 'E2E')
-    await page.fill('input[type="password"]', 'password')
-    await bootstrapBtn.click()
-    await page.waitForTimeout(1000)
-  }
-  await page.fill('input[type="email"]', email)
-  if (await page.locator('input[type="text"]').isVisible({ timeout: 1000 }).catch(() => false)) {
-    await page.fill('input[type="text"]', 'E2E')
-  }
-  await page.fill('input[type="password"]', 'password')
-  const loginBtn = page.locator('button:has-text("登录")')
-  if (await loginBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-    await loginBtn.click()
-  } else {
-    await page.click('button[type="submit"]')
-  }
-  await page.waitForURL('**/projects', { timeout: 15000 })
+  await loginWithFreshAccount(page, 'workflow-cas', 'E2E')
 }
 
 test.describe('02 · Workflow Draft CAS', () => {
@@ -37,16 +16,22 @@ test.describe('02 · Workflow Draft CAS', () => {
     await page.click('text=新建工作流')
     await page.waitForURL('**/canvas?workflow_id=**', { timeout: 15000 })
 
-    await expect(page.locator('.canvas-toolbar')).toBeVisible({ timeout: 10000 })
-    await page.click('text=保存')
-    await page.waitForTimeout(500)
+    const canvas = page.getByTestId('workflow-canvas')
+    await expect(canvas).toHaveAttribute('aria-busy', 'false', { timeout: 10000 })
+    await Promise.all([
+      page.waitForResponse((response) => response.request().method() === 'PUT'
+        && /\/api\/v1\/workflows\/[^/]+\/draft$/.test(response.url())
+        && response.status() === 200),
+      page.getByRole('button', { name: '保存', exact: true }).click(),
+    ])
 
     await page.reload()
     await page.waitForURL('**/canvas?workflow_id=**', { timeout: 15000 })
-    await expect(page.locator('.canvas-toolbar')).toBeVisible({ timeout: 10000 })
+    await expect(canvas).toHaveAttribute('aria-busy', 'false', { timeout: 10000 })
 
-    await page.click('text=dry-run')
-    await page.waitForTimeout(500)
-    await expect(page.locator('.compile-panel')).toBeVisible({ timeout: 5000 })
+    await page.getByTestId('workflow-dry-run').click()
+    // The empty Draft is intentionally invalid. This checks that dry-run
+    // reaches the compiler and exposes its structured diagnostic after reload.
+    await expect(page.getByTestId('compile-result')).toContainText('工作流图不包含任何节点', { timeout: 30_000 })
   })
 })

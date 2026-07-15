@@ -3,17 +3,17 @@ ToonFlow Backend — API Routes for Workflow
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 import uuid
 
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from src.domain.workflow.compiler import WorkflowCompiler, CompilationError
+from src.domain.workflow.compiler import CompilationContext, WorkflowCompiler, CompilationError
 from src.domain.workflow.sql_workflow_service import SqlWorkflowService
 from src.infra.db.registry_repository import SqlRegistryService
 from src.schemas.models import NodeDefinitionRevision, PortTypeRef, RegistrySnapshot
-from src.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationError_
+from src.core.exceptions import ConflictError, ForbiddenError, NotFoundError, SafeError, ValidationError_
 from src.infra.db.identity_repository import get_session_store
 from src.schemas.models import OwnerScope
 from src.infra.db.agent_repository import SqlAgentRepository
@@ -24,8 +24,12 @@ from src.infra.db.models import (
     ResourceGrantSnapshotModel,
     ResourceModel,
     ResourceRevisionModel,
+    WorkflowRunModel,
 )
 from src.infra.db.session import get_session_factory
+from src.domain.template.template_service import PackageDependency, ReplacementSlot, WorkflowPackageManifest
+from src.infra.db.template_repository import SqlTemplateService, _contains_forbidden
+from src.schemas.enums import DependencyKind
 
 router = APIRouter(prefix="/api/v1/workflows", tags=["workflows"])
 
@@ -50,6 +54,48 @@ class SaveDraftRequest(BaseModel):
     pinned_dependency_revisions: list[str] = Field(default_factory=list)
 
 
+class ImportWorkflowRequest(BaseModel):
+    """An imported graph is always a mutable, untrusted draft."""
+
+    graph: dict[str, Any] = Field(default_factory=dict)
+    config: dict[str, Any] = Field(default_factory=dict)
+    layout: dict[str, Any] = Field(default_factory=dict)
+    pinned_dependency_revisions: list[str] = Field(default_factory=list)
+    package_manifest: ImportPackageManifest | None = None
+    replacements: dict[str, str] = Field(default_factory=dict)
+
+
+class ImportPackageDependency(BaseModel):
+    dep_id: str
+    kind: DependencyKind
+    revision_id: str
+    name: str = ""
+    schema_id: str = ""
+    inclusion_mode: str = "required"
+    grant_required: bool = False
+    capability_requirements: list[str] = Field(default_factory=list)
+    replacement_slot: str | None = None
+
+
+class ImportReplacementSlot(BaseModel):
+    slot_id: str
+    label: str
+    description: str = ""
+    expected_kind: DependencyKind = DependencyKind.RESOURCE
+    required: bool = True
+
+
+class ImportPackageManifest(BaseModel):
+    """Versioned, typed external package contract; unknown versions fail closed."""
+
+    name: str
+    version: Literal["1.0.0"] = "1.0.0"
+    dependencies: list[ImportPackageDependency] = Field(default_factory=list)
+    replacement_slots: list[ImportReplacementSlot] = Field(default_factory=list)
+    parameter_schema: dict[str, Any] = Field(default_factory=dict)
+    description: str = ""
+
+
 class RollbackDraftRequest(BaseModel):
     """Explicit confirmation that the owner reviewed the target revision."""
 
@@ -72,6 +118,74 @@ def _resolve_owner(authorization: str | None) -> OwnerScope:
 
 def _failed_diagnostic(message: str, location: str = "registry") -> dict[str, Any]:
     return {"status": "failed", "diagnostics": [{"severity": "error", "location": location, "message": message}]}
+
+
+def _compilation_context(owner: OwnerScope) -> CompilationContext:
+    """Create the only policy input accepted by authenticated HTTP compile.
+
+    AtlasCloud is the platform provider.  This is deliberately server-owned:
+    callers cannot smuggle capabilities, a different provider policy, or an
+    entitlement allow flag through a compile request.
+    """
+    return CompilationContext(
+        actor_scope=owner.scoped_id,
+        entitlement_decision={"allowed": True, "decision_id": f"owner:{owner.scoped_id}", "policy_revision": "toonflow.entitlement.v1"},
+        provider_selection_policy_ref="atlascloud.default.v1",
+        policy_revision="toonflow.workflow_compile.v1",
+        capability_snapshot_ref="atlascloud.capabilities.v1",
+        available_capabilities=("atlascloud.llm", "atlascloud.image", "atlascloud.video"),
+    )
+
+
+def _resolve_latest_at_compile(graph: dict[str, Any], owner: OwnerScope) -> dict[str, Any]:
+    """Replace explicit latest-at-compile intent with immutable IDs.
+
+    This resolver is invoked only while freezing a Revision.  It never writes
+    the draft and refuses unknown/foreign values, so an import can retain
+    intent but a runnable revision cannot contain ``latest``.
+    """
+    def resolve(value: Any, session: Any) -> Any:
+        if isinstance(value, list):
+            return [resolve(item, session) for item in value]
+        if not isinstance(value, dict):
+            return value
+        result = {key: resolve(item, session) for key, item in value.items()}
+        is_latest = result.get("latest_at_compile") is True or result.get("revision_id") == "latest" or result.get("artifact_version_id") == "latest"
+        if not is_latest:
+            return result
+        if result.get("resource_id"):
+            try:
+                resource_id = uuid.UUID(str(result["resource_id"]))
+            except (TypeError, ValueError) as exc:
+                raise ValidationError_("latest_at_compile ResourceRef resource_id is invalid") from exc
+            resource = session.get(ResourceModel, resource_id)
+            if resource is None:
+                raise NotFoundError("Resource", str(resource_id))
+            rows = session.query(ResourceRevisionModel).filter(ResourceRevisionModel.resource_id == resource_id).order_by(ResourceRevisionModel.revision_number.desc()).all()
+            revision = next((row for row in rows if str(row.revision_status.value) == "active"), None)
+            if revision is None:
+                raise ValidationError_("latest_at_compile ResourceRef has no active immutable revision")
+            if resource.owner_scope != owner.scoped_id:
+                grant_id = result.get("grant_snapshot_id")
+                grant = session.get(ResourceGrantSnapshotModel, uuid.UUID(str(grant_id))) if grant_id else None
+                if grant is None or grant.resource_revision_id != revision.revision_id or grant.grantee_scope != owner.scoped_id or grant.status != "active":
+                    raise ForbiddenError("跨 owner latest ResourceRef 必须固定当前 active GrantSnapshot")
+            result["revision_id"] = str(revision.revision_id)
+        elif result.get("artifact_id"):
+            try:
+                artifact_id = uuid.UUID(str(result["artifact_id"]))
+            except (TypeError, ValueError) as exc:
+                raise ValidationError_("latest_at_compile ArtifactRef artifact_id is invalid") from exc
+            artifact = session.query(ArtifactVersionModel).filter(ArtifactVersionModel.artifact_id == artifact_id, ArtifactVersionModel.owner_scope == owner.scoped_id).order_by(ArtifactVersionModel.created_at.desc()).first()
+            if artifact is None:
+                raise ForbiddenError("latest_at_compile ArtifactRef must resolve within owner_scope")
+            result["artifact_version_id"] = str(artifact.artifact_version_id)
+        else:
+            raise ValidationError_("latest_at_compile reference requires resource_id or artifact_id")
+        result.pop("latest_at_compile", None)
+        return result
+    with get_session_factory()() as session:
+        return resolve(graph, session)
 
 
 def _assert_graph_reference_authorization(graph: dict[str, Any], owner: OwnerScope) -> None:
@@ -263,6 +377,69 @@ async def create_workflow(body: CreateWorkflowRequest, authorization: str | None
     return {"workflow_id": str(workflow.workflow_id), "owner_scope": workflow.owner_scope.scoped_id}
 
 
+@router.post("/import", status_code=201)
+async def import_workflow(body: ImportWorkflowRequest, authorization: str | None = Header(None)) -> dict[str, Any]:
+    """Import untrusted JSON as a Draft only.
+
+    Deliberately do not resolve latest refs, create a Revision, snapshot the
+    registry, or activate anything here.  The normal owner-reviewed publish
+    route is the sole transition into an executable Revision.
+    """
+    owner = _resolve_owner(authorization)
+    package_resolution: dict[str, Any] | None = None
+    config = dict(body.config)
+    if body.package_manifest is not None:
+        # A package is an archive boundary, not merely its manifest.  Do not
+        # retain a credential-shaped value in the untrusted Draft and hope a
+        # later compiler pass notices it.
+        if _contains_forbidden(body.graph) or _contains_forbidden(config):
+            raise HTTPException(status_code=422, detail={"error": {
+                "code": "PACKAGE_FORBIDDEN_CONTENT",
+                "message": "Imported package must not contain secret or CredentialBinding content",
+            }})
+        manifest = WorkflowPackageManifest(
+            name=body.package_manifest.name,
+            version=body.package_manifest.version,
+            dependencies=[PackageDependency(**dependency.model_dump()) for dependency in body.package_manifest.dependencies],
+            replacement_slots=[ReplacementSlot(**slot.model_dump()) for slot in body.package_manifest.replacement_slots],
+            parameter_schema=body.package_manifest.parameter_schema,
+            description=body.package_manifest.description,
+        )
+        try:
+            package_resolution = SqlTemplateService().resolve_import_manifest(
+                manifest, replacements=body.replacements, owner_scope=owner,
+            )
+        except SafeError as exc:
+            raise HTTPException(status_code=422, detail=exc.to_dict()) from exc
+        if not package_resolution["resolved"]:
+            raise HTTPException(status_code=422, detail={"error": {
+                "code": "PACKAGE_DEPENDENCY_UNRESOLVED",
+                "message": "Imported package dependencies are unavailable",
+                "details": package_resolution,
+            }})
+        config["import_package_manifest"] = manifest.to_dict()
+        config["import_dependency_mapping"] = package_resolution["resolution"]
+        config["import_replacement_mapping"] = dict(body.replacements)
+    workflow = _workflow_service.create_workflow(owner_scope=owner)
+    draft = _workflow_service.get_draft(workflow.workflow_id)
+    try:
+        saved = _workflow_service.save_draft(
+            workflow.workflow_id, body.graph, config, body.layout,
+            draft.graph_hash, body.pinned_dependency_revisions,
+        )
+    except Exception:
+        # Avoid a half-created import when normalization/persistence rejects
+        # malformed input. No execution records can exist for this workflow.
+        _workflow_service.delete_workflow(workflow.workflow_id)
+        raise
+    return {
+        "workflow_id": str(workflow.workflow_id), "draft_version": saved.draft_version,
+        "graph_hash": saved.graph_hash, "trust_state": "untrusted_draft",
+        "active_revision_id": None,
+        "package_resolution": package_resolution,
+    }
+
+
 @router.get("/{workflow_id}")
 async def get_workflow(workflow_id: uuid.UUID, authorization: str | None = Header(None)):
     """Get a specific workflow."""
@@ -335,6 +512,11 @@ async def compile_workflow(workflow_id: uuid.UUID, authorization: str | None = H
             raise HTTPException(status_code=404, detail="No draft or revision found")
         graph = draft.graph
 
+    try:
+        graph = _resolve_latest_at_compile(graph, owner)
+    except (ForbiddenError, NotFoundError, ValidationError_) as exc:
+        return _failed_diagnostic(exc.message, "input_ref")
+
     # 2. Get the latest registry snapshot
     try:
         registry = _registry_for_revision(revision.revision_id if revision else None) if revision else _snapshot_for_graph(graph, owner, persist=False)
@@ -356,6 +538,7 @@ async def compile_workflow(workflow_id: uuid.UUID, authorization: str | None = H
             workflow_revision_id=revision.revision_id if revision else uuid.uuid4(),
             graph=graph,
             registry_snapshot=registry,
+            compilation_context=_compilation_context(owner),
         )
         return {
             "status": "compiled",
@@ -385,15 +568,19 @@ async def publish_revision(workflow_id: uuid.UUID, authorization: str | None = H
     # catalog that predates an official/public node baseline.
     draft = _workflow_service.get_draft(workflow_id)
     try:
-        _assert_graph_reference_authorization(draft.graph, owner)
+        resolved_graph = _resolve_latest_at_compile(draft.graph, owner)
+        _assert_graph_reference_authorization(resolved_graph, owner)
     except (ForbiddenError, NotFoundError, ValidationError_) as exc:
         raise HTTPException(status_code=422, detail=exc.to_dict()) from exc
     try:
-        snapshot = _snapshot_for_graph(draft.graph, owner, persist=True)
+        snapshot = _snapshot_for_graph(resolved_graph, owner, persist=True)
     except (ForbiddenError, ValidationError_, NotFoundError) as exc:
         raise HTTPException(status_code=422, detail=exc.to_dict()) from exc
     try:
-        revision, plan = _workflow_service.publish_compiled_revision(workflow_id, snapshot, _compiler)
+        revision, plan = _workflow_service.publish_compiled_revision(
+            workflow_id, snapshot, _compiler, graph_override=resolved_graph,
+            compilation_context=_compilation_context(owner),
+        )
     except CompilationError as exc:
         raise HTTPException(status_code=422, detail=exc.to_dict()) from exc
     return {
@@ -489,11 +676,61 @@ async def dry_run_compile(workflow_id: uuid.UUID, authorization: str | None = He
     if registry is None:
         return {"passes": False, "diagnostics": [_failed_diagnostic("没有可用的 RegistrySnapshot")["diagnostics"][0]]}
 
-    passes, diagnostics = _compiler.dry_run(graph=graph, registry_snapshot=registry)
+    try:
+        graph = _resolve_latest_at_compile(graph, owner)
+    except (ForbiddenError, NotFoundError, ValidationError_) as exc:
+        return {"passes": False, "diagnostics": [_failed_diagnostic(exc.message, "input_ref")["diagnostics"][0]]}
+    passes, diagnostics = _compiler.dry_run(graph=graph, registry_snapshot=registry, compilation_context=_compilation_context(owner))
     return {
         "passes": passes,
         "diagnostics": diagnostics,
     }
+
+
+@router.get("/{workflow_id}/revisions")
+async def list_revisions(workflow_id: uuid.UUID, authorization: str | None = Header(None)) -> dict[str, Any]:
+    """Owner-scoped immutable history, including retired revisions."""
+    owner = _resolve_owner(authorization)
+    try:
+        workflow = _workflow_service.get_workflow(workflow_id)
+        if workflow.owner_scope.scoped_id != owner.scoped_id:
+            raise NotFoundError("Workflow", str(workflow_id))
+        revisions = _workflow_service.list_revisions(workflow_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=exc.to_dict()) from exc
+    with get_session_factory()() as session:
+        counts = {
+            revision.revision_id: session.query(WorkflowRunModel).filter(WorkflowRunModel.workflow_revision_id == revision.revision_id).count()
+            for revision in revisions
+        }
+    return {"workflow_id": str(workflow_id), "revisions": [{
+        "revision_id": str(revision.revision_id), "revision_number": revision.revision_number,
+        "status": revision.revision_status.value, "graph_hash": revision.graph_hash,
+        "execution_hash": revision.execution_hash, "registry_snapshot_id": str(revision.registry_snapshot_id),
+        "created_at": revision.created_at.isoformat() if revision.created_at else None,
+        "run_count": counts[revision.revision_id],
+    } for revision in revisions]}
+
+
+@router.get("/{workflow_id}/revisions/{revision_id}")
+async def get_revision(workflow_id: uuid.UUID, revision_id: uuid.UUID, authorization: str | None = Header(None)) -> dict[str, Any]:
+    """Read an immutable revision even after it has been retired."""
+    owner = _resolve_owner(authorization)
+    try:
+        workflow = _workflow_service.get_workflow(workflow_id)
+        revision = _workflow_service.get_revision(revision_id)
+        if workflow.owner_scope.scoped_id != owner.scoped_id or revision.workflow_id != workflow_id:
+            raise NotFoundError("WorkflowRevision", str(revision_id))
+        graph = _workflow_service.get_revision_graph(revision_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=exc.to_dict()) from exc
+    with get_session_factory()() as session:
+        run_count = session.query(WorkflowRunModel).filter(WorkflowRunModel.workflow_revision_id == revision_id).count()
+    return {"workflow_id": str(workflow_id), "revision_id": str(revision_id),
+            "revision_number": revision.revision_number, "status": revision.revision_status.value,
+            "graph_hash": revision.graph_hash, "execution_hash": revision.execution_hash,
+            "registry_snapshot_id": str(revision.registry_snapshot_id), "graph": graph,
+            "run_count": run_count}
 
 
 @router.get("/by-owner")

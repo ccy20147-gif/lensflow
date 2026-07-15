@@ -1,21 +1,8 @@
 import { expect, test } from '@playwright/test'
+import { loginWithFreshAccount } from './auth'
 
 async function login(page: any) {
-  await page.goto('/login')
-  await page.waitForSelector('.login-card', { timeout: 15_000 })
-  const email = `canvas-resource-${Date.now()}-${Math.random().toString(36).slice(2, 6)}@toonflow.local`
-  const bootstrap = page.getByRole('button', { name: '初始化' })
-  if (await bootstrap.isVisible({ timeout: 1_500 }).catch(() => false)) {
-    await page.locator('input[type="email"]').fill(email)
-    await page.locator('input[type="text"]').fill('Canvas Resource')
-    await page.locator('input[type="password"]').fill('password')
-    await bootstrap.click()
-  }
-  await page.locator('input[type="email"]').fill(email)
-  if (await page.locator('input[type="text"]').isVisible({ timeout: 800 }).catch(() => false)) await page.locator('input[type="text"]').fill('Canvas Resource')
-  await page.locator('input[type="password"]').fill('password')
-  await page.getByRole('button', { name: '登录' }).click()
-  await page.waitForURL('**/projects', { timeout: 15_000 })
+  await loginWithFreshAccount(page, 'canvas-resource', 'Canvas Resource')
 }
 
 test('canvas supports reversible palette editing and resource library has a canonical revision flow', async ({ page }) => {
