@@ -1104,17 +1104,22 @@ class RuntimeWorker:
     def recover_pending(self) -> RecoveryReport:
         """Recover durable state after restart without re-submitting unknown work.
 
-        Two passes:
-          1. ``UNKNOWN`` attempts remain UNKNOWN until provider task binding
+        Three passes:
+          1. ``recover_stale_leases`` reclaims attempts whose lease has
+             already expired; the parent NodeRun is reset to ``PENDING``
+             so the scheduler materialises a fresh attempt on the next
+             pass.  Provider dispatch outbox is never replayed here.
+          2. ``UNKNOWN`` attempts remain UNKNOWN until provider task binding
              reconciliation or an authenticated callback proves an outcome.
-          2. ``WAITING_EXTERNAL`` provider attempts whose lease has expired
+          3. ``WAITING_EXTERNAL`` provider attempts whose lease has expired
              are re-emitted as ``provider.dispatch`` outbox events so the
              runner can reissue the call.
 
-        Both passes are committed atomically each; the function returns a
+        All passes are committed atomically each; the function returns a
         snapshot of the resulting counts.
         """
         now = datetime.now(timezone.utc)
+        recovered_leases = self._runtime.recover_stale_leases(now=now)
         self.recover_subworkflow_timeouts()
         # A Tool submission whose worker died after recording its durable
         # idempotency fence is unknown, never eligible for a blind replay.
@@ -1167,8 +1172,18 @@ class RuntimeWorker:
         return RecoveryReport(
             unknown_attempts=unknown_count,
             waiting_external=waiting_count,
-            requeued_attempts=requeued,
+            requeued_attempts=requeued + recovered_leases,
         )
+
+    def heartbeat(self, attempt_id: UUID, worker_id: str, *, ttl: timedelta | None = None) -> datetime:
+        """Refresh the lease for an attempt the worker is still executing.
+
+        A worker should call this in a tight loop (e.g. every 30-60s) for
+        any attempt whose execution may exceed ``DEFAULT_LEASE_DURATION``.
+        Returns the new ``lease_expires_at`` so the worker can schedule its
+        next heartbeat deterministically.
+        """
+        return self._runtime.heartbeat_attempt(attempt_id, worker_id=worker_id, ttl=ttl)
 
     # ------------------------------------------------------------------
     # Schema helpers

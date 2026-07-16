@@ -163,6 +163,7 @@ ProviderInvocationAttempt 不拥有独立状态机，复用关联 NodeRunAttempt
 - adapter 回退时固定旧能力 snapshot；不支持的新模型停止新运行。
 - 发布证据包括 secret 扫描、真实调用、fallback 和轮换演练。
 - 2026-07-16 Foundation 验收：批次 C 的持久 Provider 调用事实链已独立验证，包括提交 intent、stable idempotency key、unknown 对账、结果 fencing、单 record/多 output binding 与 dispatch/result outbox dedupe_key；`8c9d0e1f2a3b` 增加部分唯一 `(purpose, dedupe_key)` 约束。真实 Provider spike 未配置凭证，未作为通过证据；能力版本矩阵、健康、fallback、轮换与完整真实调用仍在交付中，状态为 `in_delivery`。
+- 2026-07-16 V0 hardening 验收：`9b0c1d2e3f4a` 使 `provider_dispatch_rejected` 审计事件按 provider attempt 幂等；结果写事务重验 epoch/run/attempt fence，取消或 supersede 的晚到结果只留下单个 discarded audit。PostgreSQL 专项 22 passed。真实 Provider spike、健康、fallback、轮换与账单对账仍未关闭。
 
 ## 16. 已决策事项与开放问题
 

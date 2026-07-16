@@ -179,7 +179,7 @@ discovered -> defined -> reviewed -> approved -> in_delivery
 | TF-WF-003 | 图编译、执行计划与策略校验 | 平台内核 | Foundation | P0 | 运行前冻结完整计划；禁止边运行边解释草稿 | 独立验收：固定 Revision、计划、canonical owner 授权、能力报告与结构化诊断通过 | `requirements/TF-WF-003.md` | verified |
 | TF-WF-004 | Workflow 草稿与不可变修订 | 主画布/平台内核 | Foundation -> V0 -> V1 Core | P0 | 画布位置与执行 hash 分离；任何运行固定 revision | 独立验收：Draft/Proposal 完整 hash CAS、发布、运行隔离、diff 与回滚测试通过 | `requirements/TF-WF-004.md` | verified |
 | TF-WF-005 | Artifact、Resource 与 lineage | 平台内核/资源库 | Foundation | P0 | ArtifactVersion 是运行产物真相；World/Character 等为一等资源 | 独立验收：不可变版本链、CAS、lineage、stale、跨 owner 与显式提升测试通过 | `requirements/TF-WF-005.md` | verified |
-| TF-WF-006 | 持久 DAG 执行与异步恢复 | 平台内核 | Foundation -> V0 -> V1 Core | P0 | V0 最小持久运行；V1 完成 attempt、lease、epoch、task binding、outbox 和恢复 | Foundation 独立验收：固定持久 plan、epoch fencing、dispatch/result outbox、unknown、取消和 owner 绑定回归通过；V0/V1 待交付 | `requirements/TF-WF-006.md` | in_delivery |
+| TF-WF-006 | 持久 DAG 执行与异步恢复 | 平台内核 | Foundation -> V0 -> V1 Core | P0 | V0 最小持久运行；V1 完成 attempt、lease、epoch、task binding、outbox 和恢复 | Foundation + V0 hardening 独立验收：固定计划、phase-2 fence、lease recovery、outbox/unknown/取消回归通过；完整 V0/V1 待交付 | `requirements/TF-WF-006.md` | in_delivery |
 | TF-WF-007 | 控制流、批处理、子工作流与局部运行 | 平台内核/主画布 | V1 Core | P0 | Condition、Join、Fallback、有限 Map、OrderedMap/Fold；允许固定修订、有限深度、无递归 SubworkflowCall | 分支、缺失输入、checkpoint、调用深度、上游/下游闭包测试 | `requirements/TF-WF-007.md` | in_delivery |
 | TF-WF-008 | Human Gate 与 RequestInput | 主画布/平台内核 | V1 Core | P0 | 决策持久化；智能体可等待用户；前端弹窗不是事实源 | waiting_user、恢复、超时、重复提交和强制 gate 测试 | `requirements/TF-WF-008.md` | in_delivery |
 | TF-WF-009 | 工作流模板与依赖包 | 模板入口/平台内核 | V0 -> V1 Core | P0 | V0 内置模板；V1 完成 typed dependency、依赖闭包和替换槽；社区上架由 TF-COM-003 管理 | 内置模板复制、依赖解析、缺失/私有依赖阻断测试 | `requirements/TF-WF-009.md` | in_delivery |
@@ -247,7 +247,7 @@ discovered -> defined -> reviewed -> approved -> in_delivery
 
 | ID | 需求 | 全局位置 | 目标版本 | 优先级 | 边界摘要 | 交付证据 | 详细文档 | 状态 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| TF-OPS-001 | Provider、模型与密钥管理 | 设置/平台内核 | Foundation -> V1 Core | P0 | 密钥不进图和日志；能力快照、选择策略和实际调用记录均版本化 | Foundation 独立验收：持久 invocation、outbox dedupe、unknown 与结果事务回归通过；真实 Provider spike、健康、fallback 和轮换待交付 | `requirements/TF-OPS-001.md` | in_delivery |
+| TF-OPS-001 | Provider、模型与密钥管理 | 设置/平台内核 | Foundation -> V1 Core | P0 | 密钥不进图和日志；能力快照、选择策略和实际调用记录均版本化 | Foundation + V0 hardening 独立验收：持久 invocation、rejected callback dedupe、phase-2 fencing 与结果事务回归通过；真实 Provider spike、健康、fallback 和轮换待交付 | `requirements/TF-OPS-001.md` | in_delivery |
 | TF-OPS-002 | 成本、配额、预算与用量 | 设置/运行内核 | V0 -> V1 Core | P0 | 运行前估算/预留，运行后实际记账；V1 可无支付 | 超预算阻断、偏差、取消和用户用量展示测试 | `requirements/TF-OPS-002.md` | defined |
 | TF-OPS-003 | 文件、Blob 与媒体资产存储 | 资源库/平台内核 | Foundation -> V0 | P0 | Foundation Blob/UploadSession 合同已验证；V0 继续真实对象存储与可恢复上传 | Foundation 独立验收：完整性、引用保护、生命周期与重建；V0 上传/签名读取待交付 | `requirements/TF-OPS-003.md` | in_delivery |
 | TF-OPS-004 | RunEvent、通知与任务状态 | 产品外壳/平台内核 | V0 -> V1 Core | P0 | 数据库事件是真相，SSE/WebSocket 只是投递 | after_seq 回放、重连、通知去重和状态恢复测试 | `requirements/TF-OPS-004.md` | defined |

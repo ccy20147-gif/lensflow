@@ -49,7 +49,7 @@
 | `TF-WF-003.md` | Foundation | 工作流平台/安全 | main-agent | verified | [x] | 已独立验收；解锁持久运行与模板编译 | `compiler.py`, `entitlement_gate.py`, `compile_resolver.py`; PostgreSQL 专项/依赖回归 143 passed（2026-07-16） |
 | `TF-WF-004.md` | Foundation -> V0 -> V1 Core | 工作流平台 | main-agent | verified | [x] | 已独立验收；后续依赖可进入实施 | `workflow_service.py`, `draft_revision.py`, `sql_workflow_service.py`, `architect_service.py`; PostgreSQL/API/Architect 专项 34 passed（2026-07-15）；前端 typecheck/test/build 通过 |
 | `TF-WF-005.md` | Foundation | 数据平台/工作流平台 | main-agent | verified | [x] | 已独立验收；解锁编译与下游资源合同 | `artifact_repository.py`, `resource_repository.py`, `blob_service.py`; PostgreSQL 专项/回归 91 passed（2026-07-16） |
-| `TF-WF-006.md` | Foundation -> V0 -> V1 Core | 运行时平台 | main-agent | in_delivery | [ ] | Foundation 已独立验收；V0 最小持久运行与 V1 lease/复杂恢复待交付 | `runtime_service.py`, `worker.py`; PostgreSQL 运行时/回调/局部重跑专项 45 passed，迁移 `8c9d0e1f2a3b`（2026-07-16） |
+| `TF-WF-006.md` | Foundation -> V0 -> V1 Core | 运行时平台 | main-agent | in_delivery | [ ] | Foundation 与 V0 hardening 已独立验收；完整 V0 最小持久运行与 V1 复杂恢复待交付 | `runtime_service.py`, `worker.py`; Foundation 回归 45 passed，V0 fence/lease/partial-run 专项 22 passed，迁移至 `9b0c1d2e3f4a`（2026-07-16） |
 | `TF-WF-007.md` | V1 Core | 运行时平台 | main-agent | in_delivery | [ ] | 控制流节点（Condition/Join/Fallback/Map/Fold） | models.py 中相关类型定义 |
 | `TF-WF-008.md` | V1 Core | 运行时平台/核心产品 | main-agent | in_delivery | [ ] | Human Gate + RequestInput 持久化 | runtime_service.py, models.py |
 | `TF-WF-009.md` | V0 -> V1 Core | 模板产品/工作流平台 | main-agent | in_delivery | [ ] | 模板服务（PackageManifest/依赖/实例化） | template_service.py, test_template.py (16 tests) |
@@ -107,7 +107,7 @@
 
 | PRD | 目标版本 | 责任域 | 个人 DRI | 状态 | 完成 | 下一动作/阻塞 | 证据索引 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `TF-OPS-001.md` | Foundation -> V1 Core | Provider 平台/安全 | 待认领 | in_delivery | [ ] | Foundation 已独立验收；真实 Provider spike、健康、fallback、轮换与 V1 矩阵待交付 | `runtime_service.py`, `worker.py`; PostgreSQL provider/outbox 专项 45 passed，迁移 `8c9d0e1f2a3b`；真实凭证 gate 未关闭（2026-07-16） |
+| `TF-OPS-001.md` | Foundation -> V1 Core | Provider 平台/安全 | 待认领 | in_delivery | [ ] | Foundation 与 V0 hardening 已独立验收；真实 Provider spike、健康、fallback、轮换与 V1 矩阵待交付 | `runtime_service.py`, `worker.py`; provider/outbox Foundation 45 passed，rejected callback/fence 专项 22 passed，迁移 `9b0c1d2e3f4a`；真实凭证 gate 未关闭（2026-07-16） |
 | `TF-OPS-002.md` | V0 -> V1 Core | FinOps/运行时 | 待认领 | defined | [ ] | 等待身份、编译、运行时和 Provider 合同 | - |
 | `TF-OPS-003.md` | Foundation -> V0 | 存储平台 | main-agent | in_delivery | [ ] | Foundation 已验证；V0 仍需真实对象存储、私有签名读取与分片/断点续传 | `blob_service.py`, `storage.py`; PostgreSQL 专项/回归 91 passed（2026-07-16） |
 | `TF-OPS-004.md` | V0 -> V1 Core | 事件平台 | 待认领 | defined | [ ] | 等待 PLT-001、WF-006 | - |

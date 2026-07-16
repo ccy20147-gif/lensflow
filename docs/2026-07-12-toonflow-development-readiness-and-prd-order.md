@@ -158,6 +158,8 @@ F7 关闭后，公共版本、编译、持久运行、存储、安全、Provider
 
 2026-07-16：F7 的 `TF-WF-006` 与 `TF-OPS-001` 以“批次 C：持久运行与 Provider 调用事实链”完成 Foundation slice 独立验收。固定持久 plan、epoch fencing、输出绑定 owner、dispatch/result outbox dedupe、unknown 对账和取消隔离已验证；两项仍为 `in_delivery`，真实 Provider spike、V0 最小持久运行与 V1 的 lease/复杂恢复、fallback 和健康矩阵不得据此关闭。
 
+2026-07-16：批次 C V0 hardening 对 `TF-WF-006` / `TF-OPS-001` 的 phase-2 fencing、lease heartbeat/recovery、partial-run 闭包和 rejected callback 单次审计完成独立验收。该切片不改变两项 `in_delivery` 状态，也不关闭真实 Provider gate、完整 V0 或 V1 范围。
+
 ### 7.2 V0
 
 1. 并行 V0-A：`TF-PLT-001.md`、`TF-WF-009.md`、`TF-WF-010.md`

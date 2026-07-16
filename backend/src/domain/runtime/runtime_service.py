@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import func, select
@@ -393,16 +393,28 @@ class RuntimeService:
         *,
         output_refs: list[dict] | None = None,
         epoch: int | None = None,
+        expected_lease_id: str | None = None,
     ) -> NodeRunAttempt:
-        """Complete an attempt with epoch/fencing check."""
+        """Complete an attempt with epoch/fencing + lease ownership checks.
+
+        ``expected_lease_id`` is the worker's last-known lease id; when
+        supplied, the row's ``lease_id`` must match exactly.  A racing worker
+        whose lease was revoked (e.g. by ``recover_stale_leases``) cannot
+        silently publish.
+        """
         if self._session_factory is not None:
             with self._session_factory.begin() as session:
                 attempt = self._sql_required(session, NodeRunAttemptModel, attempt_id, "NodeRunAttempt")
+                self._enforce_attempt_lease_fence(attempt, expected_lease_id)
                 if epoch is not None and attempt.execution_epoch != epoch:
                     raise ConflictError("执行纪元过期，结果被拒绝")
                 if attempt.status in {AttemptStatus.SUPERSEDED, AttemptStatus.CANCELLED}:
                     raise ConflictError("终态或过期 attempt 不能发布结果")
                 attempt.status, attempt.completed_at = AttemptStatus.COMPLETED, datetime.now(timezone.utc)
+                # Releasing the lease on terminal transition prevents a stale
+                # worker from accidentally heartbeating or holding the row.
+                attempt.lease_id = None
+                attempt.lease_expires_at = None
                 node = self._sql_required(session, NodeRunModel, attempt.node_run_id, "NodeRun")
                 node.status = NodeRunStatus.COMPLETED
                 run = self._sql_required(session, WorkflowRunModel, node.run_id, "WorkflowRun")
@@ -419,19 +431,163 @@ class RuntimeService:
 
         attempt.status = AttemptStatus.COMPLETED
         attempt.completed_at = datetime.now(timezone.utc)
+        attempt.lease_id = None
+        attempt.lease_expires_at = None
 
         node_run = self._get_node_run(attempt.node_run_id)
         node_run.status = NodeRunStatus.COMPLETED
         return attempt
 
-    def fail_attempt(self, attempt_id: uuid.UUID) -> NodeRunAttempt:
-        """Mark attempt as failed."""
+    def heartbeat_attempt(
+        self,
+        attempt_id: uuid.UUID,
+        *,
+        worker_id: str,
+        ttl: timedelta | None = None,
+    ) -> datetime:
+        """Refresh the lease for a still-running attempt.
+
+        Returns the new ``lease_expires_at``.  Raises :class:`ConflictError`
+        when ``worker_id`` does not own the active lease, when the attempt
+        is no longer LEASED/RUNNING, or when its current lease has already
+        expired (a stale lease is a sign that ``recover_stale_leases`` has
+        superseded this attempt).
+        """
+        if self._session_factory is None:
+            raise ConflictError("Lease heartbeat requires durable runtime storage")
+        if not worker_id:
+            raise ValidationError_("Worker id is required for lease heartbeat")
+        duration = ttl or timedelta(minutes=5)
+        now = datetime.now(timezone.utc)
+        new_expires_at = now + duration
+        with self._session_factory.begin() as session:
+            attempt = self._sql_required(session, NodeRunAttemptModel, attempt_id, "NodeRunAttempt")
+            if attempt.status not in {AttemptStatus.LEASED, AttemptStatus.RUNNING}:
+                raise ConflictError(f"Attempt {attempt_id} 状态为 {attempt.status}，不能续约")
+            if attempt.lease_id != worker_id:
+                raise ConflictError("Lease 不归属此 worker，续约被拒绝")
+            if attempt.lease_expires_at is not None and attempt.lease_expires_at.tzinfo is None:
+                # SQLite-only defensive; production always persists tz-aware.
+                attempt.lease_expires_at = attempt.lease_expires_at.replace(tzinfo=timezone.utc)
+            if attempt.lease_expires_at is not None and attempt.lease_expires_at <= now:
+                # Stale lease already expired; recover_stale_leases (or a
+                # concurrent caller) has fenced this attempt.
+                raise ConflictError("Lease 已过期，attempt 已被 fenced")
+            attempt.lease_expires_at = new_expires_at
+            session.add(OutboxEventModel(
+                event_id=uuid.uuid4(),
+                aggregate_type="node_run_attempt",
+                aggregate_id=attempt.attempt_id,
+                event_type="attempt.heartbeat",
+                purpose="attempt_leased",
+                payload={
+                    "worker_id": worker_id,
+                    "execution_epoch": attempt.execution_epoch,
+                    "lease_expires_at": new_expires_at.isoformat(),
+                },
+                created_at=now,
+            ))
+            session.flush()
+        return new_expires_at
+
+    def recover_stale_leases(self, *, now: datetime | None = None) -> int:
+        """Re-queue attempts whose lease has expired without a result.
+
+        A crashed worker's leased attempt is no longer making progress.
+        We mark it ``SUPERSEDED`` and reset its parent ``NodeRun`` so the
+        scheduler can materialise a fresh attempt on the next pass.
+        Crucially, this never replays an external dispatch outbox — only
+        local in-flight execution is recovered.
+
+        P0 hardening: ``_sql_schedule_ready`` is invoked so a fresh
+        ``PENDING`` ``NodeRunAttempt`` is materialised on the same
+        ``NodeRun`` with the persisted fixed_input preserved.  Without
+        this, ``claim_next_attempt`` would observe no claimable row and
+        the worker's progress would be permanently shelved.
+        """
+        if self._session_factory is None:
+            return 0
+        now = now or datetime.now(timezone.utc)
+        recovered = 0
+        with self._session_factory.begin() as session:
+            rows = list(session.scalars(
+                select(NodeRunAttemptModel).where(
+                    NodeRunAttemptModel.status.in_([AttemptStatus.LEASED, AttemptStatus.RUNNING]),
+                    NodeRunAttemptModel.lease_expires_at.is_not(None),
+                    NodeRunAttemptModel.lease_expires_at < now,
+                )
+            ))
+            superseded_node_ids: set[uuid.UUID] = set()
+            for attempt in rows:
+                attempt.status = AttemptStatus.SUPERSEDED
+                attempt.lease_id = None
+                attempt.lease_expires_at = None
+                node = session.get(NodeRunModel, attempt.node_run_id)
+                if node is not None and node.status in {NodeRunStatus.RUNNING, NodeRunStatus.READY}:
+                    # Re-queue: the scheduler will materialise a new
+                    # attempt on the same node_run with the persisted
+                    # fixed_input preserved.
+                    node.status = NodeRunStatus.PENDING
+                    superseded_node_ids.add(node.node_run_id)
+                session.add(OutboxEventModel(
+                    event_id=uuid.uuid4(),
+                    aggregate_type="node_run_attempt",
+                    aggregate_id=attempt.attempt_id,
+                    event_type="attempt.superseded",
+                    purpose="attempt_leased",
+                    payload={
+                        "reason": "lease_expired",
+                        "execution_epoch": attempt.execution_epoch,
+                        "node_run_id": str(attempt.node_run_id),
+                    },
+                    created_at=now,
+                ))
+                recovered += 1
+            # Flush the superseded status changes so ``_sql_schedule_ready``
+            # sees them when it queries ``NodeRunAttemptModel`` below —
+            # otherwise the stale LEASED values in the identity map return
+            # ``existing != None`` and the new attempt is never created.
+            session.flush()
+            # Materialise a fresh PENDING attempt per affected node.  This
+            # is the durable handoff the worker needs to make progress:
+            # without a claimable row, claim_next_attempt would skip
+            # the node indefinitely.
+            for node_run_id in superseded_node_ids:
+                node = session.get(NodeRunModel, node_run_id)
+                if node is None or node.status != NodeRunStatus.PENDING:
+                    continue
+                run = self._sql_required(session, WorkflowRunModel, node.run_id, "WorkflowRun")
+                self._sql_schedule_ready(session, run)
+            return recovered
+
+    @staticmethod
+    def _enforce_attempt_lease_fence(attempt: Any, expected_lease_id: str | None) -> None:
+        """Reject terminal transitions from a worker that no longer owns the row."""
+        if expected_lease_id is None:
+            return
+        active_lease = attempt.lease_id
+        if active_lease is None:
+            raise ConflictError("Attempt 没有活动 lease，发布被拒绝")
+        if active_lease != expected_lease_id:
+            raise ConflictError("Lease 不归属此 worker，发布被拒绝")
+
+    def fail_attempt(self, attempt_id: uuid.UUID, *, expected_lease_id: str | None = None) -> NodeRunAttempt:
+        """Mark attempt as failed.
+
+        ``expected_lease_id`` is an optional fence; when supplied the row's
+        ``lease_id`` must match exactly.  This blocks a stale worker from
+        silently failing a fresh attempt that has already been claimed by
+        another worker.
+        """
         if self._session_factory is not None:
             with self._session_factory.begin() as session:
                 attempt = self._sql_required(session, NodeRunAttemptModel, attempt_id, "NodeRunAttempt")
+                self._enforce_attempt_lease_fence(attempt, expected_lease_id)
                 if attempt.status in {AttemptStatus.SUPERSEDED, AttemptStatus.CANCELLED}:
                     raise ConflictError("终态或过期 attempt 不能失败发布")
                 attempt.status, attempt.completed_at = AttemptStatus.FAILED, datetime.now(timezone.utc)
+                attempt.lease_id = None
+                attempt.lease_expires_at = None
                 node = self._sql_required(session, NodeRunModel, attempt.node_run_id, "NodeRun")
                 node.status = NodeRunStatus.FAILED
                 # A failed node may have one explicit Workflow-owned fallback.
@@ -1109,6 +1265,72 @@ class RuntimeService:
         return row
 
     @staticmethod
+    def _sql_emit_discarded_event(
+        session: Any,
+        provider_attempt_id: uuid.UUID,
+        run: Any,
+        attempt: Any,
+    ) -> None:
+        """Audit a late Provider result that was rejected by the run-level fence.
+
+        A late callback/result arriving after the run has been cancelled or
+        the attempt has been superseded must not be silently dropped.  We
+        write a durable ``provider.discarded`` event so the diagnostic
+        correlation remains complete (provider_attempt_id → attempt → run
+        → reason).  The event is idempotent via the partial unique index
+        ``(purpose='provider_dispatch_rejected', dedupe_key)`` — duplicate
+        late callbacks therefore collapse to a single audit row at the
+        database boundary.
+        """
+        # The dedicated ``provider_dispatch_rejected`` purpose is covered
+        # by the ``uq_outbox_events_dispatch_rejected`` partial unique
+        # index added in the P1 hardening migration.  Calling this
+        # helper twice for the same provider_attempt_id raises an
+        # ``IntegrityError`` which the outer caller may choose to
+        # swallow — see ``_sql_emit_discarded_event_idempotent`` for the
+        # preferred entry point.
+        session.add(OutboxEventModel(
+            event_id=uuid.uuid4(),
+            aggregate_type="provider_invocation",
+            aggregate_id=provider_attempt_id,
+            event_type="provider.discarded",
+            purpose="provider_dispatch_rejected",
+            dedupe_key=str(provider_attempt_id),
+            payload={
+                "run_id": str(run.run_id),
+                "run_status": str(run.status),
+                "attempt_id": str(attempt.attempt_id),
+                "attempt_status": str(attempt.status),
+                "execution_epoch": int(attempt.execution_epoch),
+            },
+            created_at=datetime.now(timezone.utc),
+        ))
+
+    def _sql_emit_discarded_event_idempotent(self, provider_attempt_id: uuid.UUID) -> None:
+        """Persist ``provider.discarded`` once per provider_attempt_id.
+
+        Wraps :meth:`_sql_emit_discarded_event` in its own transaction and
+        silently swallows the ``IntegrityError`` that the partial unique
+        index raises on a duplicate insert.  This guarantees the audit
+        row exists exactly once even when many late callbacks race for
+        the same provider_attempt_id.
+        """
+        from sqlalchemy.exc import IntegrityError
+
+        assert self._session_factory is not None
+        with self._session_factory.begin() as session:
+            provider = self._sql_required(session, ProviderInvocationAttemptModel, provider_attempt_id, "ProviderInvocationAttempt")
+            attempt = self._sql_required(session, NodeRunAttemptModel, provider.node_run_attempt_id, "NodeRunAttempt")
+            run = self._sql_required(session, WorkflowRunModel, self._sql_required(session, NodeRunModel, attempt.node_run_id, "NodeRun").run_id, "WorkflowRun")
+            try:
+                self._sql_emit_discarded_event(session, provider_attempt_id, run, attempt)
+                session.flush()
+            except IntegrityError:
+                # A concurrent caller already wrote the audit row; the
+                # partial unique index is the durable fence.
+                pass
+
+    @staticmethod
     def _authorize_human_gate(session: Any, task: HumanTaskModel, actor_scope: str) -> None:
         """Enforce the V1 owner/assignee boundary from server-authenticated scope."""
         run = session.get(WorkflowRunModel, task.run_id)
@@ -1360,12 +1582,29 @@ class RuntimeService:
         closure only restricts scheduling to the listed ``execute`` and
         ``reuse`` nodes.  This keeps the partial-run slice anchored to
         the durable plan and prevents a caller from widening the executed
-        DAG beyond what the plan author approved.
+        DAG beyond what the plan author approved.  Any node id referenced
+        in the closure but absent from the persisted graph is rejected
+        fail-closed; partial runs are immutable slices, not speculative
+        schedules.
         """
         execute = {str(value) for value in closure.get("execute", [])}
         reuse = {str(value) for value in closure.get("reuse", [])}
-        if not execute or execute & reuse:
+        skip = {str(value) for value in closure.get("skip", [])}
+        if not execute or execute & reuse or (reuse & skip) or (execute & skip):
             raise ValidationError_("Partial run closure is invalid")
+        persisted_node_ids = {
+            str(node.get("id"))
+            for node in persisted_graph.get("nodes", [])
+            if isinstance(node, dict) and node.get("id")
+        }
+        unknown_execute = sorted(execute - persisted_node_ids)
+        unknown_reuse = sorted(reuse - persisted_node_ids)
+        if unknown_execute or unknown_reuse:
+            raise ConflictError(
+                "Partial run closure references nodes outside the persisted plan: "
+                f"execute={','.join(unknown_execute) or '∅'}; "
+                f"reuse={','.join(unknown_reuse) or '∅'}"
+            )
         persisted_nodes = [
             node for node in persisted_graph.get("nodes", [])
             if isinstance(node, dict) and str(node.get("id")) in execute
@@ -1461,7 +1700,19 @@ class RuntimeService:
                 # never by a synthetic parent attempt.
                 row.status = NodeRunStatus.RUNNING
                 continue
-            existing = session.scalar(select(NodeRunAttemptModel).where(NodeRunAttemptModel.node_run_id == row.node_run_id))
+            # A NodeRun only needs a fresh attempt when no active attempt
+            # exists.  ``SUPERSEDED`` attempts (from a prior crashed
+            # worker recovered by ``recover_stale_leases``) are
+            # intentionally ignored: they are durable history, not a
+            # claimable claim.
+            existing = session.scalar(select(NodeRunAttemptModel).where(
+                NodeRunAttemptModel.node_run_id == row.node_run_id,
+                NodeRunAttemptModel.status.in_([
+                    AttemptStatus.PENDING, AttemptStatus.LEASED,
+                    AttemptStatus.RUNNING, AttemptStatus.WAITING_EXTERNAL,
+                    AttemptStatus.UNKNOWN,
+                ]),
+            ))
             if existing is None:
                 committed_refs: list[dict[str, Any]] = []
                 upstream_artifact_refs: list[dict[str, Any]] = []
@@ -1504,9 +1755,19 @@ class RuntimeService:
                     fixed_input["media_recipe_revision_id"] = str(node_config["media_recipe_revision_id"])
                 if fallback_sources:
                     fixed_input["fallback_for_node_ids"] = [item.node_instance_id for item in fallback_sources]
+                # Count prior attempts (including SUPERSEDED) so the
+                # scheduler can stamp a fresh execution_epoch.  A retry
+                # from a recovered worker must observe a monotonic
+                # epoch even when the prior attempt was superseded.
+                prior_count = session.scalar(
+                    select(func.count()).select_from(NodeRunAttemptModel)
+                    .where(NodeRunAttemptModel.node_run_id == row.node_run_id)
+                ) or 0
+                next_epoch = int(prior_count) + 1
                 session.add(NodeRunAttemptModel(
-                    attempt_id=uuid.uuid4(), node_run_id=row.node_run_id, attempt_number=1,
-                    execution_epoch=1, fixed_input=fixed_input, status=AttemptStatus.PENDING,
+                    attempt_id=uuid.uuid4(), node_run_id=row.node_run_id,
+                    attempt_number=next_epoch, execution_epoch=next_epoch,
+                    fixed_input=fixed_input, status=AttemptStatus.PENDING,
                 ))
         if run.status != RunStatus.QUEUED:
             self._sql_aggregate_run(session, run)
@@ -1857,22 +2118,48 @@ class RuntimeService:
     ) -> tuple[ProviderInvocationRecord, OutboxEvent]:
         """Atomically persist record, all output bindings, cost and publish event."""
         assert self._session_factory is not None
-        with self._session_factory.begin() as session:
+        # Phase 1: peek fence state so the ``provider.discarded`` audit row
+        # can survive even when the write transaction rolls back.
+        with self._session_factory() as session:
             provider = self._sql_required(session, ProviderInvocationAttemptModel, provider_attempt_id, "ProviderInvocationAttempt")
             attempt = self._sql_required(session, NodeRunAttemptModel, provider.node_run_attempt_id, "NodeRunAttempt")
-            if current_epoch is not None and attempt.execution_epoch != current_epoch:
-                raise ConflictError("执行纪元过期，结果被拒绝")
+            run_id_for_audit = self._sql_required(session, NodeRunModel, attempt.node_run_id, "NodeRun").run_id
+            run = self._sql_required(session, WorkflowRunModel, run_id_for_audit, "WorkflowRun")
             existing = session.scalar(select(ProviderInvocationRecordModel).where(ProviderInvocationRecordModel.provider_attempt_id == provider_attempt_id))
+            epoch_mismatch = current_epoch is not None and attempt.execution_epoch != current_epoch
+            fence_rejected = (
+                run.status in {RunStatus.CANCELLING, RunStatus.CANCELLED}
+                or attempt.status in {AttemptStatus.CANCELLED, AttemptStatus.SUPERSEDED}
+            )
+            if epoch_mismatch or fence_rejected:
+                self._sql_emit_discarded_event_idempotent(provider_attempt_id)
+                if epoch_mismatch:
+                    raise ConflictError("执行纪元过期，结果被拒绝")
+                raise ConflictError("Cancelled or superseded attempt cannot publish a provider result")
             if existing is not None:
                 event = session.scalar(select(OutboxEventModel).where(OutboxEventModel.aggregate_id == provider_attempt_id, OutboxEventModel.event_type == "provider.result"))
                 if event is None:
                     raise ConflictError("幂等 Provider 结果缺少 result outbox")
                 return self._provider_record_schema(existing), self._outbox_schema(event)
+        # Phase 2: actual write transaction.
+        # P0 hardening: re-validate the fencing state inside the write
+        # transaction so a concurrent cancel_run or epoch supersede
+        # (phase 1 → cancel commits → phase 2 begins) cannot produce a
+        # partial Artifact + Record + Binding + result outbox.  The DB
+        # contract is the only authoritative gate; phase 1 is a fast
+        # path for the common case.
+        with self._session_factory.begin() as session:
+            provider = self._sql_required(session, ProviderInvocationAttemptModel, provider_attempt_id, "ProviderInvocationAttempt")
+            attempt = self._sql_required(session, NodeRunAttemptModel, provider.node_run_attempt_id, "NodeRunAttempt")
             node_run = self._sql_required(session, NodeRunModel, attempt.node_run_id, "NodeRun")
             run = self._sql_required(session, WorkflowRunModel, node_run.run_id, "WorkflowRun")
+            if current_epoch is not None and attempt.execution_epoch != current_epoch:
+                self._sql_emit_discarded_event_idempotent(provider_attempt_id)
+                raise ConflictError("执行纪元过期，结果被拒绝")
             if run.status in {RunStatus.CANCELLING, RunStatus.CANCELLED} or attempt.status in {
                 AttemptStatus.CANCELLED, AttemptStatus.SUPERSEDED,
             }:
+                self._sql_emit_discarded_event_idempotent(provider_attempt_id)
                 raise ConflictError("Cancelled or superseded attempt cannot publish a provider result")
             missing = session.scalar(select(func.count()).select_from(ArtifactVersionModel).where(ArtifactVersionModel.artifact_version_id.in_(artifact_ids))) if artifact_ids else 0
             if artifact_ids and missing != len(set(artifact_ids)):
@@ -1931,23 +2218,46 @@ class RuntimeService:
         assert self._session_factory is not None
         if not outputs:
             raise ValidationError_("Provider result must contain at least one typed output")
-        with self._session_factory.begin() as session:
+        # Phase 1: peek fence state in a read-only transaction so we can
+        # emit the ``provider.discarded`` audit row BEFORE the main result
+        # transaction commits and re-raises the fence error.
+        with self._session_factory() as session:
             provider = self._sql_required(session, ProviderInvocationAttemptModel, provider_attempt_id, "ProviderInvocationAttempt")
             attempt = self._sql_required(session, NodeRunAttemptModel, provider.node_run_attempt_id, "NodeRunAttempt")
-            if current_epoch is not None and attempt.execution_epoch != current_epoch:
-                raise ConflictError("执行纪元过期，结果被拒绝")
             existing = session.scalar(select(ProviderInvocationRecordModel).where(ProviderInvocationRecordModel.provider_attempt_id == provider_attempt_id))
+            epoch_mismatch = current_epoch is not None and attempt.execution_epoch != current_epoch
+            run = self._sql_required(session, WorkflowRunModel, self._sql_required(session, NodeRunModel, attempt.node_run_id, "NodeRun").run_id, "WorkflowRun")
+            fence_rejected = (
+                run.status in {RunStatus.CANCELLING, RunStatus.CANCELLED}
+                or attempt.status in {AttemptStatus.CANCELLED, AttemptStatus.SUPERSEDED}
+            )
+            if epoch_mismatch or fence_rejected:
+                self._sql_emit_discarded_event_idempotent(provider_attempt_id)
+                if epoch_mismatch:
+                    raise ConflictError("执行纪元过期，结果被拒绝")
+                raise ConflictError("Cancelled or superseded attempt cannot publish a provider result")
             if existing is not None:
                 event = session.scalar(select(OutboxEventModel).where(OutboxEventModel.aggregate_id == provider_attempt_id, OutboxEventModel.event_type == "provider.result"))
                 ids = list(session.scalars(select(ProviderOutputBindingModel.output_artifact_version_id).where(ProviderOutputBindingModel.record_id == existing.record_id).order_by(ProviderOutputBindingModel.output_index)))
                 if event is None:
                     raise ConflictError("幂等 Provider 结果缺少 result outbox")
                 return self._provider_record_schema(existing), self._outbox_schema(event), ids
+        # Phase 2: actual write transaction for new records.
+        # P0 hardening: re-validate fence state inside the write
+        # transaction; see ``_sql_record_provider_result`` for the
+        # rationale.
+        with self._session_factory.begin() as session:
+            provider = self._sql_required(session, ProviderInvocationAttemptModel, provider_attempt_id, "ProviderInvocationAttempt")
+            attempt = self._sql_required(session, NodeRunAttemptModel, provider.node_run_attempt_id, "NodeRunAttempt")
             node_run = self._sql_required(session, NodeRunModel, attempt.node_run_id, "NodeRun")
             run = self._sql_required(session, WorkflowRunModel, node_run.run_id, "WorkflowRun")
+            if current_epoch is not None and attempt.execution_epoch != current_epoch:
+                self._sql_emit_discarded_event_idempotent(provider_attempt_id)
+                raise ConflictError("执行纪元过期，结果被拒绝")
             if run.status in {RunStatus.CANCELLING, RunStatus.CANCELLED} or attempt.status in {
                 AttemptStatus.CANCELLED, AttemptStatus.SUPERSEDED,
             }:
+                self._sql_emit_discarded_event_idempotent(provider_attempt_id)
                 raise ConflictError("Cancelled or superseded attempt cannot publish a provider result")
             now = datetime.now(timezone.utc)
             artifact_ids: list[uuid.UUID] = []
