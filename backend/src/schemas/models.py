@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from .enums import (
     AccountStatus,
     AttemptStatus,
+    BlobStatus,
     CredentialStatus,
     EvidenceType,
     GovernanceDecision,
@@ -22,6 +23,7 @@ from .enums import (
     RequirementStatus,
     RevisionStatus,
     RunStatus,
+    UploadSessionStatus,
 )
 
 T = TypeVar("T")
@@ -75,6 +77,29 @@ class ArtifactRef(BaseModel):
     artifact_version_id: UUID
     schema_id: str
     schema_version: int
+    # The canonical owner scope is recorded alongside the version id so
+    # cross-owner consumers can detect a forged same-owner ArtifactRef at
+    # compile/read time without an extra lookup.  It is optional in the
+    # Pydantic shape for backwards-compatible payloads, but the public
+    # resolve path always rejects cross-owner refs regardless of whether
+    # the caller declared it.
+    owner_scope: OwnerScope | None = None
+
+
+class LineageEdge(BaseModel):
+    """Per-edge immutable provenance used to build lineage graphs.
+
+    Order is significant: consumers replay edges by ascending ``order``.
+    ``role`` distinguishes primary inputs from derived sources (for example
+    ``reference`` vs ``mask`` for a generation ArtifactVersion).
+    """
+
+    source_ref: dict[str, Any]
+    role: str = "input"
+    order: int = 0
+    producer: dict[str, Any] = {}
+    transformation: dict[str, Any] = {}
+    captured_policy_refs: list[str] = []
 
 
 class ArtifactVersion(BaseModel):
@@ -106,6 +131,12 @@ class Resource(BaseModel):
     # artifact/blob hash and makes the promotion independently auditable.
     source_content_hash: str | None = None
     elevation_event_id: UUID | None = None
+    # Immutable promotion provenance recorded in the same transaction as
+    # the Resource row.  ``bootstrap`` resources have no upstream source;
+    # ``output_binding`` / ``selection_record`` carry the durable id.
+    promotion_source_kind: str = "bootstrap"
+    promotion_source_ref_id: UUID | None = None
+    promotion_source_artifact_version_id: UUID | None = None
     created_at: datetime | None = None
 
 
@@ -140,6 +171,107 @@ class ResourceRevision(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Blob / Storage (TF-OPS-003)
+# ---------------------------------------------------------------------------
+
+
+class BlobRef(BaseModel):
+    """Public reference to a Blob.  Business code stores ``blob_id``; the
+    internal storage key is never exposed through this shape.
+    """
+
+    blob_id: UUID
+    owner_scope: OwnerScope
+    media_type: str
+    size_bytes: int
+    content_hash: str
+    status: BlobStatus = BlobStatus.UPLOADING
+    storage_key: str = ""  # populated only for server-side lookup, never returned
+    created_at: datetime | None = None
+
+
+class UploadSession(BaseModel):
+    session_id: UUID
+    blob_id: UUID
+    owner_scope: OwnerScope
+    expected_size_bytes: int
+    expected_content_hash: str
+    idempotency_key: str
+    status: UploadSessionStatus = UploadSessionStatus.INITIATED
+    part_state: list[dict[str, Any]] = []
+    expires_at: datetime | None = None
+    created_at: datetime | None = None
+
+
+class BlobReference(BaseModel):
+    """Reference table entry that ties a Blob to its consumer rows.
+
+    Every ArtifactVersion that backs onto a Blob records one row here.  The
+    reference is created in the SAME transaction as the ArtifactVersion so
+    deletion protection cannot lag behind canonical writes.
+    """
+
+    blob_id: UUID
+    artifact_version_id: UUID
+    owner_scope: OwnerScope
+    role: str = "primary"  # primary | attachment | reference
+    created_at: datetime | None = None
+
+
+class CasConflict(BaseModel):
+    """Structured conflict returned by ResourceDraft CAS or freeze.
+
+    Both sides always carry the stable ref the client needs to recover:
+    the expected base, the current persisted state and the proposed value.
+    """
+
+    resource_id: UUID
+    operation: str  # "save_draft" | "freeze"
+    base_draft_version: int
+    current_draft_version: int
+    current_content_artifact_version_id: UUID
+    proposed_content_artifact_version_id: UUID
+    reason: str = ""
+
+
+class EntitlementDecision(BaseModel):
+    """Result of re-evaluating a ResourceRef against the live grant.
+
+    Compiled plans, runs, publishes and commercial exports must recompute
+    the decision on every new action; a GrantSnapshot is evidence only.
+    """
+
+    subject_scope: OwnerScope
+    resource_revision_id: UUID
+    action: str
+    decision: str  # "allow" | "deny"
+    grant_snapshot_id: UUID | None = None
+    reason: str = ""
+    evaluated_at: datetime | None = None
+
+
+# ---------------------------------------------------------------------------
+# Promotion gate (TF-WF-005 + TF-PLT-003)
+# ---------------------------------------------------------------------------
+
+
+class PromotionSource(BaseModel):
+    """Identity of the durable producer for a Resource promotion.
+
+    The Foundation contract accepts a single, non-superseded OutputBinding
+    or SelectionRecord.  Calls that pass a bare ``artifact_id`` or an
+    ``output_binding_id`` that points to a superseded candidate MUST be
+    rejected; the resolver below enforces this.
+    """
+
+    kind: str  # "output_binding" | "selection_record"
+    binding_id: UUID | None = None
+    selection_id: UUID | None = None
+    output_index: int | None = None
+    superseded: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Workflow
 # ---------------------------------------------------------------------------
 
@@ -159,6 +291,12 @@ class WorkflowDraft(BaseModel):
     graph_hash: str = ""
     layout_hash: str = ""
     execution_hash: str = ""
+    # full_draft_hash covers every persisted draft fact including
+    # ``draft_version``.  Activate/save CAS on it; ``graph_hash`` alone is
+    # preserved for older clients and graph-hash-only diff views, but two
+    # pure layout saves would collide on graph_hash and the contract requires
+    # us to refuse the second one.
+    full_draft_hash: str = ""
     updated_at: datetime | None = None
 
 
@@ -227,10 +365,18 @@ class CompiledExecutionPlan(BaseModel):
     provider_policy_ref: str = ""
     capability_snapshots: list[str] = []
     policy_revisions: list[str] = []
+    # Structured ProviderCompilationReport persisted with the plan so the
+    # Provider outcome vocabulary is auditable on replay.  ``None`` is
+    # only produced by legacy test doubles that pre-date TF-WF-003 batch B.
+    provider_compilation_report: ProviderCompilationReport | None = None
     # Server-derived authorization evidence used at compilation time. It is
     # intentionally decision metadata only: no credential or raw policy body.
     actor_scope: str = ""
     entitlement_snapshot: dict[str, Any] = {}
+    # Frozen entitlement snapshots produced by the TF-SEC-001 minimum gate.
+    # Each entry references the canonical target id and the live decision
+    # made against the snapshot at compile time.
+    entitlement_snapshots: list[dict[str, Any]] = []
     budget_limits: dict[str, Any] = {}
     compiler_version: str = "1.0"
     plan_hash: str = ""
@@ -316,6 +462,10 @@ class OutboxEvent(BaseModel):
     event_type: str
     payload: dict[str, Any] = {}
     purpose: str  # "provider_dispatch" | "result_publish" | "notification"
+    # Foundation scope: dedupe_key pins provider_dispatch rows to the
+    # invocation_attempt_id and result_publish rows to the same id so
+    # a re-delivered event cannot create a second external side effect.
+    dedupe_key: str | None = None
     created_at: datetime | None = None
     published_at: datetime | None = None
     retry_count: int = 0

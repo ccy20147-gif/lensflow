@@ -149,4 +149,6 @@ TemplateRecord 引用 template_id、workflow_revision_id、parameter_schema、de
 
 已决策：模板只能由公开节点组成；社区上架属于 TF-COM-003。
 
+已决策：TF-PLT-003 负责模板目标/阶段/依赖/成本预览、可恢复 CreationSession 和 new/existing Project 引导实例化；用户私人模板默认 private，官方目录与社区 Listing 分离。私有 Screenplay、prompt、source span 和 lineage 只能移除或转 typed replacement slot。
+
 开放问题：包的物理归档格式可选择 JSON bundle 或压缩包，但不得改变 typed manifest、secret 排除和依赖闭包。

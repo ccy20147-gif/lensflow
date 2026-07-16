@@ -367,7 +367,17 @@ async def test_publish_resolves_latest_at_compile_to_fixed_artifact_version() ->
     graph = {"nodes": [{"id": "brief", "type": "brief", "config": {"input": {"artifact_id": artifact_id, "artifact_version_id": "latest", "latest_at_compile": True}}}], "edges": []}
     saved = await _request("PUT", f"/api/v1/workflows/{workflow_id}/draft", headers=headers, json={"graph": graph, "config": {}, "layout": {}, "base_graph_hash": draft.json()["graph_hash"]})
     assert saved.status_code == 200
-    published = await _request("POST", f"/api/v1/workflows/{workflow_id}/revisions", headers=headers)
+    # Re-read the draft to obtain the post-save full_draft_hash; the
+    # activation contract is mandatory in TF-WF-004 P0.
+    confirmed = await _request("GET", f"/api/v1/workflows/{workflow_id}/draft", headers=headers)
+    assert confirmed.status_code == 200
+    assert confirmed.json()["full_draft_hash"]
+    published = await _request(
+        "POST",
+        f"/api/v1/workflows/{workflow_id}/revisions",
+        headers=headers,
+        json={"expected_full_draft_hash": confirmed.json()["full_draft_hash"]},
+    )
     assert published.status_code == 201, published.text
     fixed = await _request("GET", f"/api/v1/workflows/{workflow_id}/revisions/{published.json()['revision_id']}", headers=headers)
     ref = fixed.json()["graph"]["nodes"][0]["config"]["input"]

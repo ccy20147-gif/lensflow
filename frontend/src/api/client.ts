@@ -274,10 +274,20 @@ export interface NodeDefinitionRecord {
 export interface WorkflowDraftRecord {
   workflow_id: string
   draft_version: number
+  // ``base_revision_id`` is filled by the read path so the canvas knows
+  // which immutable revision the current draft was forked from.  It is
+  // set by the activation transaction; older servers may omit it.
+  base_revision_id?: string | null
   graph: { nodes?: unknown[]; edges?: unknown[] } | null
   layout: Record<string, unknown> | null
   graph_hash: string
+  layout_hash?: string
   execution_hash: string
+  // ``full_draft_hash`` is the canonical compare-and-swap token: it
+  // covers graph + config + layout + draft_version.  Older servers may
+  // omit it; ``graph_hash`` alone is *not* sufficient for layout-only
+  // races.
+  full_draft_hash?: string
 }
 
 export interface CreateWorkflowResponse {
@@ -351,7 +361,14 @@ export interface SaveDraftRequest {
   graph: { nodes?: unknown[]; edges?: unknown[] }
   config: Record<string, unknown>
   layout: Record<string, unknown>
-  base_graph_hash: string
+  // ``base_graph_hash`` is the legacy graph-hash-only token.  The
+  // durable backend still accepts it for back-compat but flags a
+  // ConflictError on layout-only races; the canvas must send either
+  // ``expected_full_draft_hash`` or ``expected_draft_version`` so
+  // concurrent saves are refused before any field is overwritten.
+  base_graph_hash?: string
+  expected_draft_version?: number
+  expected_full_draft_hash?: string
   pinned_dependency_revisions?: string[]
 }
 
@@ -359,12 +376,18 @@ export function saveDraft(
   workflowId: string,
   draft: SaveDraftRequest['graph'],
   baseGraphHash: string,
+  options: {
+    expectedDraftVersion?: number
+    expectedFullDraftHash?: string
+  } = {},
 ): Promise<WorkflowDraftRecord> {
   const body: SaveDraftRequest = {
     graph: draft,
     config: {},
     layout: {},
     base_graph_hash: baseGraphHash,
+    expected_draft_version: options.expectedDraftVersion,
+    expected_full_draft_hash: options.expectedFullDraftHash,
   }
   return apiPut<WorkflowDraftRecord>(
     `/workflows/${encodeURIComponent(workflowId)}/draft`,
@@ -954,8 +977,25 @@ export function instantiateTemplate(
   return apiPost<TemplateInstance>(`/templates/${encodeURIComponent(templateId)}/instantiate`, body)
 }
 
-export function publishWorkflowRevision(workflowId: string): Promise<{ revision_id: string; compiled_plan_id: string }> {
-  return apiPost<{ revision_id: string; compiled_plan_id: string }>(`/workflows/${encodeURIComponent(workflowId)}/revisions`, {})
+export interface ActivateRevisionRequest {
+  // ``expected_full_draft_hash`` is the **required** owner-confirmed
+  // token.  The backend (Pydantic + service layer) refuses any
+  // activation that omits it or supplies a non-64-character value
+  // with a 422.  ``draft_version`` is NOT a substitute: two
+  // layout-only saves share a version delta of one but produce
+  // different full-draft hashes, and the version-only check would
+  // miss that race.
+  expected_full_draft_hash: string
+}
+
+export function publishWorkflowRevision(
+  workflowId: string,
+  body: ActivateRevisionRequest,
+): Promise<{ revision_id: string; compiled_plan_id: string }> {
+  return apiPost<{ revision_id: string; compiled_plan_id: string }>(
+    `/workflows/${encodeURIComponent(workflowId)}/revisions`,
+    body,
+  )
 }
 
 export function startWorkflowRun(workflowRevisionId: string): Promise<{ run_id: string; status: string }> {

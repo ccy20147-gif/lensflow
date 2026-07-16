@@ -17,7 +17,13 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.core.exceptions import ConflictError, NotFoundError
-from src.infra.db.models import CompiledExecutionPlanModel, WorkflowDraftModel, WorkflowModel, WorkflowRevisionModel
+from src.infra.db.models import (
+    CompiledExecutionPlanModel,
+    OutboxEventModel,
+    WorkflowDraftModel,
+    WorkflowModel,
+    WorkflowRevisionModel,
+)
 from src.infra.db.session import get_session_factory
 from src.schemas.enums import RevisionStatus
 from src.schemas.models import CompiledExecutionPlan, OwnerScope, RegistrySnapshot, Workflow, WorkflowDraft, WorkflowRevision
@@ -26,6 +32,7 @@ from .draft_revision import (
     WorkflowDiff,
     compute_diff,
     compute_draft_hashes,
+    compute_full_draft_hash,
     create_draft,
     create_revision,
     normalize_graph_and_layout,
@@ -43,6 +50,19 @@ def _to_workflow(model: WorkflowModel) -> Workflow:
 
 
 def _to_draft(model: WorkflowDraftModel) -> WorkflowDraft:
+    full_hash = getattr(model, "full_draft_hash", "") or ""
+    if not full_hash:
+        # The column was added in a forward-compatible migration; legacy
+        # rows written before it must still be readable.  Recompute on the
+        # fly so callers always see a stable compare-and-swap token.
+        raw_version = model.draft_version
+        current_version = raw_version if raw_version is not None else 0
+        full_hash = compute_full_draft_hash(  # type: ignore[arg-type]
+            str(model.graph_hash or ""),
+            str(model.layout_hash or ""),
+            str(model.execution_hash or ""),
+            current_version,
+        )
     return WorkflowDraft(
         workflow_id=model.workflow_id,
         draft_version=model.draft_version,
@@ -53,6 +73,7 @@ def _to_draft(model: WorkflowDraftModel) -> WorkflowDraft:
         graph_hash=model.graph_hash,
         layout_hash=model.layout_hash,
         execution_hash=model.execution_hash,
+        full_draft_hash=full_hash,
         updated_at=model.updated_at,
     )
 
@@ -133,7 +154,22 @@ class SqlWorkflowService:
         layout: dict[str, Any],
         base_graph_hash: str,
         pinned_dependency_revisions: list[str] | None = None,
+        *,
+        expected_draft_version: int | None = None,
+        expected_full_draft_hash: str | None = None,
     ) -> WorkflowDraft:
+        """Save a draft with full-draft compare-and-swap.
+
+        The contract is the union of every persisted draft fact.  Older
+        callers still pass ``base_graph_hash``; the layout-only race (two
+        tabs only moving a node) would silently pass a graph-hash-only CAS
+        and clobber the second save, so the durable path always evaluates
+        ``expected_draft_version`` and/or ``expected_full_draft_hash`` when
+        the caller is the canonical draft API (TF-PLT-003).  When neither
+        is provided we still require ``base_graph_hash`` to match the
+        current ``graph_hash``; this is the explicit compatibility shim
+        referenced in the task brief.
+        """
         graph, layout = normalize_graph_and_layout(graph, layout)
         graph_hash, layout_hash, execution_hash = compute_draft_hashes(
             graph, config, layout, pinned_dependency_revisions
@@ -151,9 +187,60 @@ class SqlWorkflowService:
             if model is None:
                 self._raise_workflow_or_draft_not_found(session, workflow_id)
             assert model is not None
-            if model.graph_hash != base_graph_hash:
+            current_version = int(model.draft_version or 0)  # type: ignore[arg-type]
+            current_graph_hash = str(model.graph_hash or "")
+            current_layout_hash = str(model.layout_hash or "")
+            current_execution_hash = str(model.execution_hash or "")
+            current_full_hash = str(getattr(model, "full_draft_hash", "") or "") or compute_full_draft_hash(
+                current_graph_hash, current_layout_hash, current_execution_hash, current_version,
+            )
+            # Full draft CAS, when supplied, is the authoritative token.
+            if expected_full_draft_hash is not None:
+                if expected_full_draft_hash != current_full_hash:
+                    raise ConflictError(
+                        message=(
+                            f"WorkflowDraft {workflow_id} 冲突: "
+                            f"expected_full_draft_hash {expected_full_draft_hash[:12]}… "
+                            f"与当前版本 {current_full_hash[:12]}… 不一致"
+                        ),
+                        details={
+                            "expected_full_draft_hash": expected_full_draft_hash,
+                            "current_full_draft_hash": current_full_hash,
+                            "current_draft_version": current_version,
+                            "current_graph_hash": current_graph_hash,
+                        },
+                    )
+            elif expected_draft_version is not None:
+                if expected_draft_version != current_version:
+                    raise ConflictError(
+                        message=(
+                            f"WorkflowDraft {workflow_id} 冲突: "
+                            f"expected_draft_version {expected_draft_version} "
+                            f"与当前版本 {current_version} 不一致"
+                        ),
+                        details={
+                            "expected_draft_version": expected_draft_version,
+                            "current_draft_version": current_version,
+                            "current_graph_hash": current_graph_hash,
+                        },
+                    )
+            elif current_graph_hash != base_graph_hash:
+                # Legacy path: graph-hash-only CAS.  A pure layout change
+                # would not change ``graph_hash``; the new contract requires
+                # callers to pass either ``expected_full_draft_hash`` or
+                # ``expected_draft_version`` so that a second tab cannot
+                # silently win the race.
                 raise ConflictError(
-                    message=f"WorkflowDraft {workflow_id} 冲突: base_hash {base_graph_hash} 不匹配当前版本"
+                    message=(
+                        f"WorkflowDraft {workflow_id} 冲突: "
+                        f"base_hash {base_graph_hash} 不匹配当前版本；"
+                        f"请改用 expected_draft_version 或 expected_full_draft_hash"
+                    ),
+                    details={
+                        "expected_graph_hash": base_graph_hash,
+                        "current_graph_hash": current_graph_hash,
+                        "current_draft_version": current_version,
+                    },
                 )
             protected = required_human_gate_ids(model.graph or {})
             active_graphs = session.scalars(
@@ -170,13 +257,18 @@ class SqlWorkflowService:
                     "domain_required 或 policy_required Human Gate 不得从 Draft 或 Patch 删除",
                     details={"required_gate_node_ids": sorted(removed)},
                 )
-            model.draft_version += 1
+            new_version = current_version + 1
+            new_full_hash = compute_full_draft_hash(
+                graph_hash, layout_hash, execution_hash, new_version,
+            )
+            model.draft_version = new_version
             model.graph = graph
             model.config = config
             model.layout = layout
             model.graph_hash = graph_hash
             model.layout_hash = layout_hash
             model.execution_hash = execution_hash
+            model.full_draft_hash = new_full_hash  # type: ignore[assignment]
             model.updated_at = now
             session.flush()
             return _to_draft(model)
@@ -235,40 +327,190 @@ class SqlWorkflowService:
         *,
         graph_override: dict[str, Any] | None = None,
         compilation_context: Any | None = None,
+        expected_draft_hash: str,
+        actor_id: UUID | None = None,
     ) -> tuple[WorkflowRevision, CompiledExecutionPlan]:
-        """Atomically activate only a Draft that the compiler has accepted.
+        """Atomically activate only a Draft the owner has confirmed.
 
-        The compiler is pure; its result is persisted with the immutable revision
-        in the same transaction, so no runnable half-revision can escape.
+        ``expected_draft_hash`` is the owner-confirmed full-draft token
+        and is **mandatory**.  The service refuses to start an
+        activation transaction without it so no internal caller (a
+        future test harness, a CLI tool, or a freshly added route)
+        can freeze an unconfirmed snapshot.  HTTP clients hit the
+        Pydantic 422 layer first; this guard is the second line of
+        defence.
+
+        Within a single transaction the method:
+
+        1. locks the ``WorkflowDraft`` row,
+        2. compares the supplied ``expected_draft_hash`` against the
+           persisted ``full_draft_hash`` (raising
+           ``ConflictError`` on mismatch — no revision, plan, base
+           pointer, or outbox event is created),
+        3. runs the compiler (any exception rolls back the
+           transaction),
+        4. retires the previous active revision,
+        5. inserts the new ``WorkflowRevision``,
+        6. inserts the ``CompiledExecutionPlan``,
+        7. updates ``WorkflowDraft.base_revision_id``,
+        8. inserts the ``outbox_events`` audit row.
         """
+        if not expected_draft_hash or len(expected_draft_hash) != 64:
+            # The HTTP layer already rejects this with a 422 via
+            # Pydantic; this branch catches internal callers that
+            # bypass the schema.  The error uses the same
+            # ``VALIDATION_ERROR`` envelope so callers do not need a
+            # separate catch arm.
+            from src.core.exceptions import ValidationError_
+            raise ValidationError_(
+                "激活需要 owner-confirmed expected_full_draft_hash；"
+                "该字段为 64 字符 SHA-256 必填。",
+                details={
+                    "field": "expected_draft_hash",
+                    "expected_length": 64,
+                    "received": (
+                        None if expected_draft_hash is None
+                        else f"{len(expected_draft_hash)} chars"
+                    ),
+                },
+            )
         with self._factory.begin() as session:
-            draft_model = session.execute(select(WorkflowDraftModel).where(WorkflowDraftModel.workflow_id == workflow_id).with_for_update()).scalar_one_or_none()
+            draft_model = session.execute(
+                select(WorkflowDraftModel)
+                .where(WorkflowDraftModel.workflow_id == workflow_id)
+                .with_for_update()
+            ).scalar_one_or_none()
             if draft_model is None:
                 self._raise_workflow_or_draft_not_found(session, workflow_id)
             assert draft_model is not None
             draft = _to_draft(draft_model)
+            # Owner-confirmation CAS.  Refuse if the draft was edited
+            # between the owner's read and the activation request so we
+            # never freeze an unintended snapshot.
+            if expected_draft_hash != draft.full_draft_hash:
+                raise ConflictError(
+                    message=(
+                        f"激活失败: WorkflowDraft {workflow_id} 已被修改，"
+                        f"expected_full_draft_hash 与当前 {draft.full_draft_hash[:12]}… 不一致"
+                    ),
+                    details={
+                        "expected_draft_hash": expected_draft_hash,
+                        "current_draft_hash": draft.full_draft_hash,
+                        "current_draft_version": draft.draft_version,
+                        "current_graph_hash": draft.graph_hash,
+                    },
+                )
             # A Draft may intentionally contain latest_at_compile references.
             # Its frozen Revision must not. The route resolves the graph under
             # the authenticated owner before entering this transaction.
+            activation_graph = draft.graph
+            activation_config = draft.config
+            activation_layout = draft.layout
             if graph_override is not None:
-                from .draft_revision import compute_draft_hashes, normalize_graph_and_layout
                 graph, layout = normalize_graph_and_layout(graph_override, draft.layout)
-                graph_hash, layout_hash, execution_hash = compute_draft_hashes(graph, draft.config, layout)
+                graph_hash, layout_hash, execution_hash = compute_draft_hashes(
+                    graph, draft.config, layout,
+                )
                 draft = draft.model_copy(update={
                     "graph": graph, "layout": layout, "graph_hash": graph_hash,
                     "layout_hash": layout_hash, "execution_hash": execution_hash,
                 })
-            last = session.scalar(select(WorkflowRevisionModel.revision_number).where(WorkflowRevisionModel.workflow_id == workflow_id).order_by(WorkflowRevisionModel.revision_number.desc()).limit(1)) or 0
-            revision = create_revision(workflow_id=workflow_id, draft=draft, registry_snapshot_id=registry.snapshot_id, revision_number=last + 1)
-            plan = compiler.compile(
-                workflow_revision_id=revision.revision_id, graph=draft.graph,
-                registry_snapshot=registry, compilation_context=compilation_context,
+                activation_graph = graph
+                activation_config = draft.config
+                activation_layout = layout
+            last = session.scalar(
+                select(WorkflowRevisionModel.revision_number)
+                .where(WorkflowRevisionModel.workflow_id == workflow_id)
+                .order_by(WorkflowRevisionModel.revision_number.desc())
+                .limit(1)
+            ) or 0
+            revision = create_revision(
+                workflow_id=workflow_id,
+                draft=draft,
+                registry_snapshot_id=registry.snapshot_id,
+                revision_number=last + 1,
             )
-            session.execute(update(WorkflowRevisionModel).where(WorkflowRevisionModel.workflow_id == workflow_id, WorkflowRevisionModel.revision_status == RevisionStatus.ACTIVE).values(revision_status=RevisionStatus.RETIRED))
-            revision_model = WorkflowRevisionModel(revision_id=revision.revision_id, workflow_id=workflow_id, revision_number=revision.revision_number, graph_hash=revision.graph_hash, execution_hash=revision.execution_hash, registry_snapshot_id=registry.snapshot_id, graph=draft.graph, config=draft.config, layout=draft.layout, revision_status=RevisionStatus.ACTIVE, created_at=revision.created_at)
+            # Compile inside the same transaction so a compiler failure
+            # cannot leave an isolated revision row behind.
+            try:
+                plan = compiler.compile(
+                    workflow_revision_id=revision.revision_id,
+                    graph=activation_graph,
+                    registry_snapshot=registry,
+                    compilation_context=compilation_context,
+                )
+            except Exception:
+                # Re-raise as-is; the ``with`` block below rolls back the
+                # transaction.  Do not catch the CompileError here — the
+                # caller (the HTTP route) must see a 422 with the
+                # structured diagnostics.
+                raise
+            # The previous active revision is retired *before* the new row
+            # is committed, so the unique-active invariant is never broken
+            # even under concurrent activations.
+            session.execute(
+                update(WorkflowRevisionModel)
+                .where(
+                    WorkflowRevisionModel.workflow_id == workflow_id,
+                    WorkflowRevisionModel.revision_status == RevisionStatus.ACTIVE,
+                )
+                .values(revision_status=RevisionStatus.RETIRED)
+            )
+            revision_model = WorkflowRevisionModel(
+                revision_id=revision.revision_id,
+                workflow_id=workflow_id,
+                revision_number=revision.revision_number,
+                graph_hash=revision.graph_hash,
+                execution_hash=revision.execution_hash,
+                registry_snapshot_id=registry.snapshot_id,
+                graph=activation_graph,
+                config=activation_config,
+                layout=activation_layout,
+                revision_status=RevisionStatus.ACTIVE,
+                created_at=revision.created_at,
+            )
             session.add(revision_model)
             session.flush()
-            session.add(CompiledExecutionPlanModel(plan_id=plan.plan_id, workflow_revision_id=revision.revision_id, registry_snapshot_id=registry.snapshot_id, status="succeeded", plan_hash=plan.plan_hash, compiler_version=plan.compiler_version, plan_json=plan.model_dump(mode="json"), diagnostics=[], created_at=plan.created_at))
+            session.add(CompiledExecutionPlanModel(
+                plan_id=plan.plan_id,
+                workflow_revision_id=revision.revision_id,
+                registry_snapshot_id=registry.snapshot_id,
+                status="succeeded",
+                plan_hash=plan.plan_hash,
+                compiler_version=plan.compiler_version,
+                plan_json=plan.model_dump(mode="json"),
+                diagnostics=[],
+                created_at=plan.created_at,
+            ))
+            # Pin the Draft to the just-created immutable revision so the
+            # next save CAS knows which baseline the owner reviewed.  The
+            # graph/config/layout stay mutable; only the pointer changes.
+            draft_model.base_revision_id = revision.revision_id  # type: ignore[assignment]
+            session.flush()
+            # Durable audit/notification evidence.  In the same transaction
+            # so a failure of this insert also rolls back the revision.
+            outbox_payload = {
+                "workflow_id": str(workflow_id),
+                "revision_id": str(revision.revision_id),
+                "revision_number": revision.revision_number,
+                "graph_hash": revision.graph_hash,
+                "layout_hash": draft.layout_hash,
+                "execution_hash": revision.execution_hash,
+                "registry_snapshot_id": str(registry.snapshot_id),
+                "compiled_plan_id": str(plan.plan_id),
+                "expected_draft_hash": expected_draft_hash,
+                "current_draft_hash": draft.full_draft_hash,
+                "current_draft_version": draft.draft_version,
+                "actor_id": str(actor_id) if actor_id else None,
+            }
+            session.add(OutboxEventModel(
+                event_id=uuid4(),
+                aggregate_type="workflow_revision",
+                aggregate_id=revision.revision_id,
+                event_type="workflow.revision.activated",
+                purpose="workflow_revision_activated",
+                payload=outbox_payload,
+            ))
             return revision, plan
 
     def get_successful_plan(self, revision_id: UUID) -> CompiledExecutionPlan:
@@ -397,6 +639,12 @@ class SqlWorkflowService:
 
     @staticmethod
     def _draft_model(draft: WorkflowDraft) -> WorkflowDraftModel:
+        full_hash = draft.full_draft_hash or compute_full_draft_hash(
+            draft.graph_hash,
+            draft.layout_hash,
+            draft.execution_hash,
+            draft.draft_version,
+        )
         return WorkflowDraftModel(
             workflow_id=draft.workflow_id,
             draft_version=draft.draft_version,
@@ -407,6 +655,7 @@ class SqlWorkflowService:
             graph_hash=draft.graph_hash,
             layout_hash=draft.layout_hash,
             execution_hash=draft.execution_hash,
+            full_draft_hash=full_hash,
             updated_at=draft.updated_at,
         )
 

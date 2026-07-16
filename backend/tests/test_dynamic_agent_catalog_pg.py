@@ -67,9 +67,33 @@ def test_published_agent_catalog_is_owner_scoped_and_compiles_as_pinned_nodes() 
         }
         saved = client.put(f"/api/v1/workflows/{workflow_id}/draft", headers=_headers(owner_id), json={"graph": graph, "config": {}, "layout": {}, "base_graph_hash": draft["graph_hash"], "pinned_dependency_revisions": [str(revision.revision_id)]})
         assert saved.status_code == 200
-        compiled = client.post(f"/api/v1/workflows/{workflow_id}/compile", headers=_headers(owner_id))
-        assert compiled.status_code == 200 and compiled.json()["status"] == "compiled"
-        published = client.post(f"/api/v1/workflows/{workflow_id}/revisions", headers=_headers(owner_id))
+        # Re-read the draft to obtain the post-save full_draft_hash
+        # required by the activation contract (TF-WF-004 P0).
+        confirmed = client.get(f"/api/v1/workflows/{workflow_id}/draft", headers=_headers(owner_id)).json()
+        assert confirmed["full_draft_hash"]
+        # TF-WF-003 FR-1: compilation only accepts an immutable
+        # WorkflowRevision; the preflight that produced the earlier
+        # drafts-only response now lives inside ``publish_revision``.
+        # The endpoint refuses before activation so the test exercises
+        # the runnable-plan invariant directly.
+        rejected = client.post(f"/api/v1/workflows/{workflow_id}/compile", headers=_headers(owner_id))
+        assert rejected.status_code == 200
+        assert rejected.json()["status"] == "failed"
+        assert any(
+            "ACTIVE Revision" in diagnostic.get("message", "")
+            for diagnostic in rejected.json()["diagnostics"]
+        )
+        published = client.post(
+            f"/api/v1/workflows/{workflow_id}/revisions",
+            headers=_headers(owner_id),
+            json={"expected_full_draft_hash": confirmed["full_draft_hash"]},
+        )
         assert published.status_code == 201
         snapshot = SqlRegistryService(factory).get_snapshot(UUID(published.json()["registry_snapshot_id"]))
         assert node_type in snapshot.node_definitions
+        # Once activated the same compile route returns the compiled plan
+        # for the immutable revision; this verifies the post-activation
+        # path remains runnable.
+        compiled = client.post(f"/api/v1/workflows/{workflow_id}/compile", headers=_headers(owner_id))
+        assert compiled.status_code == 200
+        assert compiled.json()["status"] == "compiled"

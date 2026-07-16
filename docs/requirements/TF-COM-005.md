@@ -119,4 +119,5 @@
 
 - 已决策：V1 只做基础检索与筛选，不做交易排名、复杂推荐或独立 Agent/Recipe 发现。
 - 已决策：搜索中的授权只为 hint；收藏只存非可执行 ResourceLocator，资源库只存取得 entitlement 后的 snapshot-backed ResourceRef，新动作必须权威决策。
+- 已决策：社区未形成真实只读内容、Listing/Moderation 和授权闭环前，TF-PLT-003 要求隐藏社区一级导航；Screenplay 不进入任何社区索引。
 - 开放问题：无阻塞 V1 Community 的开放问题。

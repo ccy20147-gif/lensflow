@@ -60,8 +60,20 @@ def test_published_recipe_is_owner_scoped_canvas_node_and_expands_only_at_runtim
         graph = {"nodes": [{"id": "recipe", "type": node_type, "data": {"node_type_id": node_type, "config": entry["config"]}}], "edges": []}
         saved = client.put(f"/api/v1/workflows/{workflow_id}/draft", headers=_headers(owner_id), json={"graph": graph, "config": {}, "layout": {}, "base_graph_hash": draft["graph_hash"], "pinned_dependency_revisions": [str(frozen.revision_id)]})
         assert saved.status_code == 200
-        assert client.post(f"/api/v1/workflows/{workflow_id}/compile", headers=_headers(owner_id)).json()["status"] == "compiled"
-        published = client.post(f"/api/v1/workflows/{workflow_id}/revisions", headers=_headers(owner_id))
+        # TF-WF-003 FR-1: compile only accepts an immutable WorkflowRevision.
+        # The preflight compile (and its runnable-plan creation) is now
+        # owned by ``publish_revision``; assert the pre-activation refusal.
+        rejected = client.post(f"/api/v1/workflows/{workflow_id}/compile", headers=_headers(owner_id)).json()
+        assert rejected["status"] == "failed"
+        # Re-read the draft so the activation carries the post-save
+        # owner-confirmed full_draft_hash (TF-WF-004 P0).
+        confirmed = client.get(f"/api/v1/workflows/{workflow_id}/draft", headers=_headers(owner_id)).json()
+        assert confirmed["full_draft_hash"]
+        published = client.post(
+            f"/api/v1/workflows/{workflow_id}/revisions",
+            headers=_headers(owner_id),
+            json={"expected_full_draft_hash": confirmed["full_draft_hash"]},
+        )
         assert published.status_code == 201
         snapshot = registry.get_snapshot(UUID(published.json()["registry_snapshot_id"]))
         assert node_type in snapshot.node_definitions

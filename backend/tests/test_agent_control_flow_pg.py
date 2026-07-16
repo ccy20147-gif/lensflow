@@ -14,7 +14,8 @@ from src.domain.agent.invocation_service import AgentInvocationService
 from src.domain.provider.atlascloud import AtlasCloudAdapter
 from src.domain.runtime.runtime_service import RuntimeService
 from src.domain.runtime.worker import RuntimeWorker
-from src.domain.workflow.compiler import WorkflowCompiler
+from src.domain.workflow.compile_resolver import make_sql_entitlement_resolver
+from src.domain.workflow.compiler import CompilationContext, WorkflowCompiler
 from src.core.exceptions import ForbiddenError
 from src.infra.db.agent_repository import SqlAgentRepository
 from src.infra.db.artifact_repository import SqlArtifactRepository
@@ -155,10 +156,23 @@ def test_cross_owner_resource_ref_is_checked_at_compile_and_again_at_agent_execu
         "agent_revision_id": str(agent.revision_id), "resource_ref": ref,
     }}], "edges": []}
     # Publication-time graph authorization and typed compilation both accept
-    # the currently active grant.
+    # the currently active grant.  TF-WF-003 P0 requires the compile-time
+    # gate to consult the SQL resolver, not the graph; inject one here
+    # so the canonical Resource owner is verified.
     _assert_graph_reference_authorization(graph, consumer)
     snapshot, _ = SqlRegistryService(get_session_factory()).create_snapshot(_agent_definitions_for_graph(graph, consumer))
-    WorkflowCompiler().compile(workflow_revision_id=uuid4(), graph=graph, registry_snapshot=snapshot)
+    compile_ctx = CompilationContext(
+        actor_scope=consumer.scoped_id,
+        entitlement_resolver=make_sql_entitlement_resolver(
+            session_factory=get_session_factory(),
+            repository=SqlResourceRepository(),
+            actor_scope=consumer,
+        ),
+    )
+    WorkflowCompiler().compile(
+        workflow_revision_id=uuid4(), graph=graph, registry_snapshot=snapshot,
+        compilation_context=compile_ctx,
+    )
     _runtime, run_id = _run(consumer, graph, inputs={"world": ref})
     resources.revoke_grant(frozen.revision_id, grant, source)
     worker, atlas = _worker()

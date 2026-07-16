@@ -4,7 +4,7 @@
 
 - ID：TF-WF-003
 - 标题：图编译、执行计划与策略校验
-- 状态：in_delivery
+- 状态：verified
 - 目标版本：Foundation
 - 优先级：P0
 - 全局位置：平台内核
@@ -140,6 +140,12 @@ CompileStatus 为 pending、succeeded、failed 和 invalidated。计划内容不
 - 发布证据包含非法图矩阵、权限预算演练和旧版本重放/拒绝报告。
 
 ## 16. 已决策事项与开放问题
+
+### 实施与独立验收证据
+
+- 2026-07-16：固定 WorkflowRevision 编译、不可变 CompiledExecutionPlan、Registry/Provider 能力快照、结构化诊断、latest/secret 拒绝与 hash 确定性已实现。
+- 编译 gate 以 canonical ArtifactVersion、Resource 与 ResourceRevision 的数据库 owner_scope 为准，不信任图中声明的 owner_scope；跨 owner ArtifactRef 一律拒绝，跨 owner ResourceRef 必须通过当前 GrantSnapshot/entitlement 重算。
+- 独立验收：PostgreSQL 专项及 Compiler/Workflow/Artifact/Resource/Authorization 回归 143 passed；`alembic upgrade head`、`ruff check src tests` 与 `mypy src` 通过。
 
 已决策：运行前冻结完整计划；Provider 不支持控制时不能静默忽略，策略值使用 `ignore_with_warning`，报告结果使用 `ignored_with_warning`。
 

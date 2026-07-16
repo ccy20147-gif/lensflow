@@ -10,8 +10,10 @@ from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from src.domain.workflow.compiler import CompilationContext, WorkflowCompiler, CompilationError
+from src.domain.workflow.compile_resolver import make_sql_entitlement_resolver
 from src.domain.workflow.sql_workflow_service import SqlWorkflowService
 from src.infra.db.registry_repository import SqlRegistryService
+from src.infra.db.resource_repository import SqlResourceRepository
 from src.schemas.models import NodeDefinitionRevision, PortTypeRef, RegistrySnapshot
 from src.core.exceptions import ConflictError, ForbiddenError, NotFoundError, SafeError, ValidationError_
 from src.infra.db.identity_repository import get_session_store
@@ -47,10 +49,27 @@ class CreateWorkflowRequest(BaseModel):
 
 
 class SaveDraftRequest(BaseModel):
+    """Full-draft CAS body.
+
+    ``base_graph_hash`` is the legacy graph-hash-only token.  ``base_revision_id``
+    was previously mistaken for a Draft identity column; it is intentionally
+    removed from this body because the Draft and Revision IDs are independent
+    and the owner never has to know the revision ID to save the draft.
+
+    ``expected_full_draft_hash`` and ``expected_draft_version`` are the
+    full-draft tokens.  When either is supplied, the request refuses
+    with a structured conflict if the draft was edited since the
+    previous read.  This is the only contract that protects against
+    two tabs only moving a node (graph_hash is identical, layout_hash
+    differs, draft_version bumps).
+    """
+
     graph: dict[str, Any] = Field(default_factory=dict)
     config: dict[str, Any] = Field(default_factory=dict)
     layout: dict[str, Any] = Field(default_factory=dict)
-    base_graph_hash: str
+    base_graph_hash: str = ""
+    expected_draft_version: int | None = None
+    expected_full_draft_hash: str | None = None
     pinned_dependency_revisions: list[str] = Field(default_factory=list)
 
 
@@ -103,6 +122,25 @@ class RollbackDraftRequest(BaseModel):
     confirm_revision_id: uuid.UUID
 
 
+class ActivateRevisionRequest(BaseModel):
+    """Owner-confirmed snapshot token for atomic activation.
+
+    The owner reads the draft, renders a confirmation report and posts
+    back the ``expected_full_draft_hash`` they reviewed.  The field is
+    required: an activation without the owner-confirmed token is
+    refused before it reaches the service layer, so an unexpected
+    snapshot can never be frozen into a new revision.
+
+    ``expected_draft_version`` is intentionally NOT a substitute for
+    the full hash — two layout-only saves share a draft_version delta
+    of one but produce different ``full_draft_hash`` values, and the
+    version-only check would not detect that race.  The service
+    additionally rejects any internal caller that omits the full hash.
+    """
+
+    expected_full_draft_hash: str = Field(min_length=64, max_length=64)
+
+
 def _resolve_owner(authorization: str | None) -> OwnerScope:
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing authorization header")
@@ -116,8 +154,11 @@ def _resolve_owner(authorization: str | None) -> OwnerScope:
     return OwnerScope(kind="user", id=account_id)
 
 
-def _failed_diagnostic(message: str, location: str = "registry") -> dict[str, Any]:
-    return {"status": "failed", "diagnostics": [{"severity": "error", "location": location, "message": message}]}
+def _failed_diagnostic(message: str, location: str = "registry", *, code: str | None = None) -> dict[str, Any]:
+    diagnostic: dict[str, Any] = {"severity": "error", "location": location, "message": message}
+    if code:
+        diagnostic["code"] = code
+    return {"status": "failed", "diagnostics": [diagnostic]}
 
 
 def _compilation_context(owner: OwnerScope) -> CompilationContext:
@@ -126,7 +167,17 @@ def _compilation_context(owner: OwnerScope) -> CompilationContext:
     AtlasCloud is the platform provider.  This is deliberately server-owned:
     callers cannot smuggle capabilities, a different provider policy, or an
     entitlement allow flag through a compile request.
+
+    The compile gate is wired with a SQL-backed entitlement resolver so
+    every cross-owner ResourceRef declared in the resolved graph is
+    re-evaluated through ``SqlResourceRepository.evaluate_entitlement``
+    before the plan is allowed to publish.
     """
+    resolver = make_sql_entitlement_resolver(
+        session_factory=get_session_factory(),
+        repository=SqlResourceRepository(),
+        actor_scope=owner,
+    )
     return CompilationContext(
         actor_scope=owner.scoped_id,
         entitlement_decision={"allowed": True, "decision_id": f"owner:{owner.scoped_id}", "policy_revision": "toonflow.entitlement.v1"},
@@ -134,6 +185,8 @@ def _compilation_context(owner: OwnerScope) -> CompilationContext:
         policy_revision="toonflow.workflow_compile.v1",
         capability_snapshot_ref="atlascloud.capabilities.v1",
         available_capabilities=("atlascloud.llm", "atlascloud.image", "atlascloud.video"),
+        entitlement_resolver=resolver,
+        default_unsupported_policy="block",
     )
 
 
@@ -466,13 +519,26 @@ async def get_draft(workflow_id: uuid.UUID, authorization: str | None = Header(N
         "config": draft.config,
         "layout": draft.layout,
         "graph_hash": draft.graph_hash,
+        "layout_hash": draft.layout_hash,
         "execution_hash": draft.execution_hash,
+        # ``full_draft_hash`` is the canonical CAS token.  Older clients
+        # fall back to ``graph_hash``; the new field is the only token
+        # that protects against pure layout-only races.
+        "full_draft_hash": draft.full_draft_hash,
+        "base_revision_id": str(draft.base_revision_id) if draft.base_revision_id else None,
     }
 
 
 @router.put("/{workflow_id}/draft")
 async def save_draft(workflow_id: uuid.UUID, body: SaveDraftRequest, authorization: str | None = Header(None)):
-    """Save a draft using graph-hash compare-and-swap."""
+    """Save a draft using full-draft compare-and-swap.
+
+    The route is the canonical draft API; it always passes the
+    owner-confirmed draft version and full hash.  ``base_graph_hash``
+    remains accepted for older clients and unit-test doubles, but the
+    service layer refuses a layout-only race by evaluating the
+    full-draft tokens first.
+    """
     try:
         if _workflow_service.get_workflow(workflow_id).owner_scope.scoped_id != _resolve_owner(authorization).scoped_id:
             raise HTTPException(status_code=404, detail="Workflow not found")
@@ -483,6 +549,8 @@ async def save_draft(workflow_id: uuid.UUID, body: SaveDraftRequest, authorizati
             layout=body.layout,
             base_graph_hash=body.base_graph_hash,
             pinned_dependency_revisions=body.pinned_dependency_revisions,
+            expected_draft_version=body.expected_draft_version,
+            expected_full_draft_hash=body.expected_full_draft_hash,
         )
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=exc.to_dict())
@@ -493,49 +561,56 @@ async def save_draft(workflow_id: uuid.UUID, body: SaveDraftRequest, authorizati
 
 @router.post("/{workflow_id}/compile")
 async def compile_workflow(workflow_id: uuid.UUID, authorization: str | None = Header(None)):
-    """Compile a workflow revision into an execution plan.
+    """Compile an immutable active WorkflowRevision into an execution plan.
 
-    Loads the latest active revision or current draft, resolves the
-    registry snapshot, and runs the compiler. Returns the plan or
-    structured diagnostics on failure.
+    FR-1 of TF-WF-003 is enforced: the input is a *fixed* revision.  If the
+    workflow has no active revision, we refuse with a 422 instead of
+    silently compiling the mutable draft, and we never return a draft
+    hash as if it were a plan hash.  The actual immutable plan is
+    produced by ``publish_revision`` (``POST /workflows/{id}/revisions``)
+    so an owner-confirmed snapshot is the only entry that creates a
+    runnable plan.
     """
     owner = _resolve_owner(authorization)
     if _workflow_service.get_workflow(workflow_id).owner_scope.scoped_id != owner.scoped_id:
         raise HTTPException(status_code=404, detail="Workflow not found")
-    # 1. Get the active revision or current draft
+    # 1. Active revision only — the draft is a mutable authoring surface,
+    # not a compile input.  Refusing here keeps the runnable-plan invariant
+    # at the public boundary.
     revision = _workflow_service.get_active_revision(workflow_id)
-    if revision:
-        graph = _workflow_service.get_revision_graph(revision.revision_id)
-    else:
-        draft = _workflow_service.get_draft(workflow_id)
-        if not draft:
-            raise HTTPException(status_code=404, detail="No draft or revision found")
-        graph = draft.graph
+    if revision is None:
+        return _failed_diagnostic(
+            "工作流没有 ACTIVE Revision；编译入口只接受不可变 Revision",
+            location="compile_input",
+        )
+    graph = _workflow_service.get_revision_graph(revision.revision_id)
 
     try:
         graph = _resolve_latest_at_compile(graph, owner)
     except (ForbiddenError, NotFoundError, ValidationError_) as exc:
         return _failed_diagnostic(exc.message, "input_ref")
 
-    # 2. Get the latest registry snapshot
+    # 2. Get the revision-pinned RegistrySnapshot.
     try:
-        registry = _registry_for_revision(revision.revision_id if revision else None) if revision else _snapshot_for_graph(graph, owner, persist=False)
-    except (ForbiddenError, ValidationError_, NotFoundError) as exc:
-        return _failed_diagnostic(exc.message, "agent")
+        registry = _registry_service.get_snapshot(revision.registry_snapshot_id)
+    except NotFoundError:
+        return _failed_diagnostic("固定 Revision 缺少其 RegistrySnapshot")
     if registry is None:
-        return _failed_diagnostic(
-            "激活 Revision 缺少其固定的 RegistrySnapshot" if revision else "没有可用的 RegistrySnapshot",
-        )
+        return _failed_diagnostic("固定 Revision 缺少其 RegistrySnapshot")
 
     try:
         _assert_graph_reference_authorization(graph, owner)
-    except (ForbiddenError, NotFoundError, ValidationError_) as exc:
+    except ForbiddenError as exc:
+        return _failed_diagnostic(exc.message, "input_ref", code="WF_INPUT_CROSS_OWNER_ARTIFACT")
+    except (NotFoundError, ValidationError_) as exc:
         return _failed_diagnostic(exc.message, "input_ref")
 
-    # 3. Run the compiler
+    # 3. Run the compiler against the fixed revision id.  The
+    # ``compile_workflow`` route is a dry-run preview; the only path
+    # that persists a runnable plan is ``publish_revision``.
     try:
         plan = _compiler.compile(
-            workflow_revision_id=revision.revision_id if revision else uuid.uuid4(),
+            workflow_revision_id=revision.revision_id,
             graph=graph,
             registry_snapshot=registry,
             compilation_context=_compilation_context(owner),
@@ -544,6 +619,7 @@ async def compile_workflow(workflow_id: uuid.UUID, authorization: str | None = H
             "status": "compiled",
             "plan_id": str(plan.plan_id),
             "plan_hash": plan.plan_hash,
+            "revision_id": str(revision.revision_id),
             "diagnostics": [],
         }
     except CompilationError as e:
@@ -554,8 +630,21 @@ async def compile_workflow(workflow_id: uuid.UUID, authorization: str | None = H
 
 
 @router.post("/{workflow_id}/revisions", status_code=201)
-async def publish_revision(workflow_id: uuid.UUID, authorization: str | None = Header(None)) -> dict[str, Any]:
-    """Freeze the current Draft into an immutable revision for its owner."""
+async def publish_revision(
+    workflow_id: uuid.UUID,
+    body: ActivateRevisionRequest,
+    authorization: str | None = Header(None),
+) -> dict[str, Any]:
+    """Freeze the current Draft into an immutable revision for its owner.
+
+    The owner-confirmation token ``expected_full_draft_hash`` is
+    mandatory.  Pydantic rejects any request that omits it or supplies
+    a non-64-character value with a stable 422 ``VALIDATION_ERROR``;
+    the service layer additionally refuses any internal call that
+    reaches it without a hash.  There is no back-compat fallback —
+    the task brief explicitly retired "no-token activation" because
+    it could freeze an unintended snapshot.
+    """
     owner = _resolve_owner(authorization)
     try:
         workflow = _workflow_service.get_workflow(workflow_id)
@@ -578,11 +667,19 @@ async def publish_revision(workflow_id: uuid.UUID, authorization: str | None = H
         raise HTTPException(status_code=422, detail=exc.to_dict()) from exc
     try:
         revision, plan = _workflow_service.publish_compiled_revision(
-            workflow_id, snapshot, _compiler, graph_override=resolved_graph,
+            workflow_id,
+            snapshot,
+            _compiler,
+            graph_override=resolved_graph,
             compilation_context=_compilation_context(owner),
+            expected_draft_hash=body.expected_full_draft_hash,
+            actor_id=owner.id,
         )
     except CompilationError as exc:
         raise HTTPException(status_code=422, detail=exc.to_dict()) from exc
+    except ConflictError as exc:
+        # Activation CAS miss: the owner reviewed a stale snapshot.
+        raise HTTPException(status_code=409, detail=exc.to_dict()) from exc
     return {
         "workflow_id": str(revision.workflow_id),
         "revision_id": str(revision.revision_id),
@@ -658,29 +755,46 @@ async def rollback_revision_to_draft(
     }
 @router.post("/{workflow_id}/compile/dry-run")
 async def dry_run_compile(workflow_id: uuid.UUID, authorization: str | None = Header(None)):
-    """Dry-run compilation — always returns diagnostics, never raises."""
+    """Dry-run compilation — always returns diagnostics, never raises.
+
+    TF-WF-003 FR-1: the dry-run preview must compile a fixed revision, not
+    the mutable draft.  When the workflow has no active revision we
+    surface a structured diagnostic so the canvas cannot iterate against
+    an unauthorised plan hash.  The preview is allowed to remain
+    non-persistent: publishing remains the only path that creates a
+    runnable plan.
+    """
     owner = _resolve_owner(authorization)
     if _workflow_service.get_workflow(workflow_id).owner_scope.scoped_id != owner.scoped_id:
         raise HTTPException(status_code=404, detail="Workflow not found")
     revision = _workflow_service.get_active_revision(workflow_id)
-    try:
-        draft = _workflow_service.get_draft(workflow_id)
-    except NotFoundError:
-        return {"passes": False, "diagnostics": [_failed_diagnostic("未找到工作流 Draft", "workflow")["diagnostics"][0]]}
-    graph = _workflow_service.get_revision_graph(revision.revision_id) if revision else draft.graph
+    if revision is None:
+        return {"passes": False, "diagnostics": [_failed_diagnostic(
+            "工作流没有 ACTIVE Revision；编译入口只接受不可变 Revision",
+            location="compile_input",
+        )["diagnostics"][0]]}
+    graph = _workflow_service.get_revision_graph(revision.revision_id)
 
     try:
-        registry = _registry_for_revision(revision.revision_id if revision else None) if revision else _snapshot_for_graph(graph, owner, persist=False)
-    except (ForbiddenError, ValidationError_, NotFoundError) as exc:
-        return {"passes": False, "diagnostics": [_failed_diagnostic(exc.message, "agent")["diagnostics"][0]]}
+        registry = _registry_service.get_snapshot(revision.registry_snapshot_id)
+    except NotFoundError as exc:
+        return {"passes": False, "diagnostics": [_failed_diagnostic(
+            exc.message, location="registry",
+        )["diagnostics"][0]]}
     if registry is None:
-        return {"passes": False, "diagnostics": [_failed_diagnostic("没有可用的 RegistrySnapshot")["diagnostics"][0]]}
+        return {"passes": False, "diagnostics": [_failed_diagnostic(
+            "固定 Revision 缺少其 RegistrySnapshot",
+        )["diagnostics"][0]]}
 
     try:
         graph = _resolve_latest_at_compile(graph, owner)
     except (ForbiddenError, NotFoundError, ValidationError_) as exc:
         return {"passes": False, "diagnostics": [_failed_diagnostic(exc.message, "input_ref")["diagnostics"][0]]}
-    passes, diagnostics = _compiler.dry_run(graph=graph, registry_snapshot=registry, compilation_context=_compilation_context(owner))
+    passes, diagnostics = _compiler.dry_run(
+        graph=graph,
+        registry_snapshot=registry,
+        compilation_context=_compilation_context(owner),
+    )
     return {
         "passes": passes,
         "diagnostics": diagnostics,

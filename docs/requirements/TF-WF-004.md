@@ -4,7 +4,7 @@
 
 - ID：TF-WF-004
 - 标题：Workflow 草稿与不可变修订
-- 状态：in_delivery
+- 状态：verified
 - 目标版本：Foundation -> V0 -> V1 Core
 - 优先级：P0
 - 全局位置：主画布/平台内核
@@ -148,8 +148,16 @@ WorkflowDraft 不复用 RevisionStatus，使用 draft_version 和保存状态。
 
 ## 16. 已决策事项与开放问题
 
+### 实施与独立验收证据
+
+- 2026-07-15：已实现完整 Draft CAS（`full_draft_hash`）、不可变 Revision、编译后原子激活、固定 Revision 运行、回滚 Draft、结构化 diff，以及 owner 确认的 Architect Proposal/Patch。
+- Architect Proposal 的兼容字段 `base_draft_hash` 语义已固定为 `WorkflowDraft.full_draft_hash`；任何 graph、config、layout 或 draft_version 变更均会使提案失效。layout-only 并发编辑会返回冲突，且不会改写 Draft 或把 Proposal 标记为已应用。
+- 独立验收（2026-07-15）：`TOONFLOW_RUN_PG_TESTS=1 uv run pytest -q tests/test_wf_004_pg_integration.py tests/test_wf_004_api_contract.py tests/test_architect_proposals.py tests/test_architect_full_draft_hash.py`，34 passed；`ruff check src tests` 与 `mypy src` 通过；前端 `pnpm typecheck`、`pnpm test`（27 passed）及 `pnpm build` 通过。
+
 已决策：任何运行固定不可变 WorkflowRevision；内部激活与社区上架是不同状态。
 
 已决策：V1 私有项目 owner-only；Agent 只输出 Proposal ArtifactVersion，WorkflowDraft/Revision 写入由 owner 确认后的平台 API 执行。
+
+已决策：Workflow 的名称、描述、封面、标签和归档状态按 TF-PLT-003 使用独立 metadata version/ETag，不进入 graph/execution hash；每个可变 WorkflowDraft 只能有一个可编辑 Project 归属。“检查并运行新版本”必须固定同一 Draft snapshot，编译失败不得创建 Revision。
 
 开放问题：Revision 自动摘要可由规则或模型生成，但不影响 hash、diff 和审计真相。

@@ -4,13 +4,13 @@
 
 - ID：TF-SEC-001
 - 标题：权限、内容安全与素材权利 Gate
-- 状态：defined
+- 状态：in_delivery
 - 版本：Foundation -> V0 -> V1 Core
 - 优先级：P0
 - 全局位置：平台内核/导出
 - 直接依赖：Foundation：TF-GOV-001、TF-ARC-001、TF-OPS-005；V0 增加 TF-PLT-001、TF-WF-005、TF-OPS-003
 - 责任域：Trust & Safety/安全平台
-- 个人 DRI：待指派
+- 个人 DRI：main-agent
 
 ## 2. 背景与问题
 
@@ -143,6 +143,11 @@
 - 紧急回退可关闭新上传/生成/导出但不能删除历史 decision/evidence/audit；恢复需重新评估排队动作。
 
 ## 16. 已决策事项与开放问题
+
+### Foundation 编译 Gate 证据
+
+- 2026-07-16：已交付最小编译准入门：canonical owner 判定、跨 owner ArtifactRef 拒绝、跨 owner ResourceRef 的 GrantSnapshot 当前 entitlement 重算、SafeError 诊断与 fail-closed resolver。
+- 该 PRD 的真人/声音同意、未成年人、人工审核、撤回事件、披露、发布/商业导出与安全评测仍未交付，保持 `in_delivery`。
 
 - 已决策：公开展示不等于允许复用；历史 GrantSnapshot 不赋予新行为，关键动作重算当前权限。
 - 已决策：真人肖像/声音、未成年人、冒充和同意撤回是 Foundation/V0/V1 的硬安全场景。

@@ -118,4 +118,5 @@
 
 - 已决策：工作流可内嵌合规 Agent/Recipe 固定修订，但 V1 Community 不产生其独立 listing。
 - 已决策：包必须闭合依赖或声明 typed replacement slot；clone、redistribute、execute 不可互相推导，凭证永不进包。
+- 已决策：Screenplay、其 source span/prompt/ArtifactRef/lineage 和其他 private-only 依赖不得内嵌；必须阻断、移除或转为不携带源内容的 typed replacement slot。
 - 开放问题：无阻塞 V1 Community 的开放问题。

@@ -20,6 +20,7 @@ from src.schemas.enums import (
     AccountStatus, ProjectStatus, RevisionStatus, RunStatus,
     AttemptStatus, NodeRunStatus, HumanTaskStatus,
     ForEachMode, MapItemStatus,
+    BlobStatus, UploadSessionStatus,
 )
 
 
@@ -69,6 +70,10 @@ class WorkflowDraftModel(Base):
     graph_hash = Column(String(64), default="")
     layout_hash = Column(String(64), default="")
     execution_hash = Column(String(64), default="")
+    # full_draft_hash = sha256(graph_hash | layout_hash | execution_hash | draft_version).
+    # The activate + save path uses this for compare-and-swap so that two
+    # layout-only saves cannot both pass a graph_hash-only CAS.
+    full_draft_hash = Column(String(64), default="", nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
@@ -188,6 +193,13 @@ class OutboxEventModel(Base):
     event_type = Column(String(255), nullable=False)
     payload = Column(JSON, default=dict)
     purpose = Column(String(64), nullable=False)
+    # Foundation scope contract: dedupe_key is a stable per-purpose
+    # fingerprint that the dispatcher uses to suppress duplicate replays.
+    # ``provider_dispatch`` rows pin ``dedupe_key`` to the
+    # ``provider_attempt_id``; ``result_publish`` rows pin it to the
+    # same id.  The partial unique index keeps the contract enforced at
+    # the database boundary.
+    dedupe_key = Column(String(128), nullable=True, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     published_at = Column(DateTime, nullable=True)
     retry_count = Column(Integer, default=0)
@@ -230,6 +242,12 @@ class ResourceModel(Base):
     source_local_id = Column(String(255), nullable=True)
     source_content_hash = Column(String(128), nullable=True)
     elevation_event_id = Column(UUID(as_uuid=True), nullable=True, unique=True)
+    # Immutable promotion provenance recorded in the SAME transaction as
+    # the Resource row.  ``promotion_source_kind`` is either "output_binding",
+    # "selection_record", or "bootstrap" for native-resource creation paths.
+    promotion_source_kind = Column(String(32), nullable=False, default="bootstrap")
+    promotion_source_ref_id = Column(UUID(as_uuid=True), nullable=True)
+    promotion_source_artifact_version_id = Column(UUID(as_uuid=True), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
@@ -315,6 +333,9 @@ class ProviderOutputBindingModel(Base):
     output_artifact_version_id = Column(UUID(as_uuid=True), ForeignKey("artifact_versions.artifact_version_id"), nullable=False)
     output_index = Column(Integer, default=0, nullable=False)
     output_label = Column(String(255), default="", nullable=False)
+    # Owner scope denormalised from the producer Run so the promotion gate
+    # can verify cross-tenant eligibility without re-walking the Run tree.
+    owner_scope = Column(String(255), nullable=False, default="", index=True)
 
 
 class WorkflowTaskBindingModel(Base):
@@ -941,4 +962,215 @@ class SubworkflowModel(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     __table_args__ = (
         UniqueConstraint("run_id", "node_instance_id", name="uq_subworkflows_run_node"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Blob / Storage (TF-OPS-003)
+# ---------------------------------------------------------------------------
+
+
+class BlobModel(Base):
+    """Durable metadata for an immutable content blob.
+
+    ``storage_key`` is the server-only internal address; the public
+    ArtifactRef / BlobRef shape exposes ``blob_id`` only.  ``status``
+    blocks ``uploading``/``quarantined``/``deletion_pending`` rows from
+    being cited as the durable backing of an ArtifactVersion.
+    """
+
+    __tablename__ = "blobs"
+
+    blob_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    owner_scope = Column(String(255), nullable=False, index=True)
+    storage_key = Column(Text, nullable=False, unique=True)
+    media_type = Column(String(255), nullable=False, default="application/octet-stream")
+    size_bytes = Column(Integer, nullable=False, default=0)
+    content_hash = Column(String(128), nullable=False, index=True)
+    status: BlobStatus = Column(  # type: ignore[assignment]
+        String(32), nullable=False, default=BlobStatus.UPLOADING,
+    )
+    quarantine_reason = Column(Text, nullable=True)
+    durability_receipt = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class UploadSessionModel(Base):
+    """Durable upload session lifecycle (TF-OPS-003 FR-3)."""
+
+    __tablename__ = "upload_sessions"
+    __table_args__ = (
+        UniqueConstraint("owner_scope", "idempotency_key", name="uq_upload_sessions_idempotency"),
+    )
+
+    session_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    blob_id = Column(UUID(as_uuid=True), ForeignKey("blobs.blob_id"), nullable=False, index=True)
+    owner_scope = Column(String(255), nullable=False, index=True)
+    expected_size_bytes = Column(Integer, nullable=False)
+    expected_content_hash = Column(String(128), nullable=False)
+    idempotency_key = Column(String(255), nullable=False)
+    status: UploadSessionStatus = Column(  # type: ignore[assignment]
+        String(32), nullable=False, default=UploadSessionStatus.INITIATED,
+    )
+    part_state = Column(JSON, nullable=False, default=list)
+    bytes_received = Column(Integer, nullable=False, default=0)
+    expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+
+
+class ArtifactBlobRefModel(Base):
+    """Durable binding of an ArtifactVersion to a backing Blob.
+
+    Inserted in the SAME transaction as the ArtifactVersion row so the
+    BlobReferenceIndex cannot drift away from canonical truth.
+    """
+
+    __tablename__ = "artifact_blob_refs"
+    __table_args__ = (
+        UniqueConstraint("artifact_version_id", "blob_id", "role", name="uq_artifact_blob_refs_triplet"),
+    )
+
+    ref_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    artifact_version_id = Column(UUID(as_uuid=True), ForeignKey("artifact_versions.artifact_version_id"), nullable=False, index=True)
+    blob_id = Column(UUID(as_uuid=True), ForeignKey("blobs.blob_id"), nullable=False, index=True)
+    owner_scope = Column(String(255), nullable=False, index=True)
+    role = Column(String(32), nullable=False, default="primary")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class BlobReferenceIndexModel(Base):
+    """Flat, owner-scoped reverse index for ``delete-check``.
+
+    The full reference set is the union of ``artifact_blob_refs`` plus the
+    rows that cite ``blobs.blob_id`` directly (resource_revisions, runs,
+    audit).  This index is a derivation of those rows and exists so a
+    reconstruction exercise can prove the canonical answer.
+    """
+
+    __tablename__ = "blob_reference_index"
+    __table_args__ = (
+        UniqueConstraint("blob_id", "ref_kind", "ref_id", name="uq_blob_reference_index"),
+    )
+
+    index_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    blob_id = Column(UUID(as_uuid=True), ForeignKey("blobs.blob_id"), nullable=False, index=True)
+    owner_scope = Column(String(255), nullable=False, index=True)
+    ref_kind = Column(String(32), nullable=False)  # artifact_version | resource_revision | run | audit
+    ref_id = Column(UUID(as_uuid=True), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class LineageEdgeModel(Base):
+    """Durable, first-class lineage rows (CANONICAL).
+
+    ``lineage_input_refs`` on ArtifactVersionModel is an immutable
+    snapshot written once in the same transaction as the ArtifactVersion
+    row and never updated by any rebuild path.  ``LineageEdgeModel`` is
+    the authoritative source for the lineage graph; the projection
+    table below caches it for cheap replay and is rebuilt from these
+    rows.
+    """
+
+    __tablename__ = "lineage_edges"
+    __table_args__ = (
+        UniqueConstraint(
+            "artifact_version_id", "order_index",
+            name="uq_lineage_edges_version_order",
+        ),
+    )
+
+    edge_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    artifact_version_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("artifact_versions.artifact_version_id"),
+        nullable=False, index=True,
+    )
+    order_index = Column(Integer, nullable=False)
+    source_ref = Column(JSON, nullable=False, default=dict)
+    role = Column(String(64), nullable=False, default="input")
+    producer = Column(JSON, nullable=False, default=dict)
+    transformation = Column(JSON, nullable=False, default=dict)
+    captured_policy_refs = Column(JSON, nullable=False, default=list)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class LineageEdgeProjectionModel(Base):
+    """Rebuildable projection of ``LineageEdgeModel`` (NON-CANONICAL).
+
+    A rebuild path may freely drop and refill this table without ever
+    touching the canonical ArtifactVersion row or its
+    ``lineage_input_refs`` snapshot.  This is what makes AC-6 ("delete
+    all projections and rebuild") safe: the canonical lineage rows
+    plus the immutable snapshot remain intact across the rebuild.
+    """
+
+    __tablename__ = "lineage_edges_projections"
+    __table_args__ = (
+        UniqueConstraint(
+            "artifact_version_id", "order_index",
+            name="uq_lineage_edges_projections_version_order",
+        ),
+    )
+
+    projection_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    artifact_version_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    order_index = Column(Integer, nullable=False)
+    source_ref = Column(JSON, nullable=False, default=dict)
+    role = Column(String(64), nullable=False, default="input")
+    producer = Column(JSON, nullable=False, default=dict)
+    transformation = Column(JSON, nullable=False, default=dict)
+    captured_policy_refs = Column(JSON, nullable=False, default=list)
+    rebuilt_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class AuditLogModel(Base):
+    """Minimal durable audit trail used by TF-OPS-003 FR-8 / FR-11.
+
+    The schema is intentionally narrow: a stable ``ref_kind`` + ``ref_id``
+    pair is sufficient to prove that a Blob was cited by an immutable
+    record at audit time.  Full audit semantics are owned by TF-OPS-005;
+    this table exists so a delete-check never silently orphans an audit
+    reference.
+    """
+
+    __tablename__ = "audit_log"
+
+    audit_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    owner_scope = Column(String(255), nullable=False, index=True)
+    event_type = Column(String(128), nullable=False)
+    blob_id = Column(UUID(as_uuid=True), ForeignKey("blobs.blob_id"), nullable=True, index=True)
+    ref_kind = Column(String(64), nullable=True)
+    ref_id = Column(UUID(as_uuid=True), nullable=True)
+    payload = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# Promotion gate (TF-WF-005 + TF-PLT-003)
+# ---------------------------------------------------------------------------
+
+
+class OutputBindingSupersedeModel(Base):
+    """Records when an OutputBinding / SelectionRecord candidate was retired.
+
+    The Foundation contract requires promotion to start from a *valid* and
+    *non-superseded* candidate; this row is the only durable source of
+    that bit.  When a candidate is re-issued (for example after a model
+    rerun), callers insert a row here and the promotion resolver refuses
+    to honour the prior binding.
+    """
+
+    __tablename__ = "output_binding_supersedes"
+
+    supersede_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    owner_scope = Column(String(255), nullable=False, index=True)
+    ref_kind = Column(String(32), nullable=False)  # "output_binding" | "selection_record"
+    ref_id = Column(UUID(as_uuid=True), nullable=False)
+    superseded_by_ref_id = Column(UUID(as_uuid=True), nullable=True)
+    reason = Column(Text, nullable=False, default="")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    __table_args__ = (
+        UniqueConstraint("ref_kind", "ref_id", name="uq_output_binding_supersede_target"),
     )

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import os
 import uuid
-from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -47,6 +46,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+TEST_USER_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+
+
+@pytest.fixture
+def test_user() -> OwnerScope:
+    return OwnerScope(kind="user", id=TEST_USER_ID)
+
+
 def _plan(revision_id: uuid.UUID) -> CompiledExecutionPlan:
     return CompiledExecutionPlan(
         plan_id=uuid.uuid4(), workflow_revision_id=revision_id,
@@ -60,7 +67,7 @@ def test_provider_result_is_atomic_and_recovers_from_postgres() -> None:
     factory = get_session_factory()
     workflow_id, revision_id = uuid.uuid4(), uuid.uuid4()
     with factory.begin() as session:
-        session.add(WorkflowModel(workflow_id=workflow_id, owner_scope="user:test"))
+        session.add(WorkflowModel(workflow_id=workflow_id, owner_scope=f"user:{TEST_USER_ID}"))
         session.add(WorkflowRevisionModel(
             revision_id=revision_id, workflow_id=workflow_id, revision_number=1,
             graph_hash="g", execution_hash="e", registry_snapshot_id=uuid.uuid4(),
@@ -68,7 +75,7 @@ def test_provider_result_is_atomic_and_recovers_from_postgres() -> None:
         ))
 
     runtime = RuntimeService(session_factory=factory)
-    run = runtime.create_run(compiled_plan=_plan(revision_id), owner_scope=OwnerScope(kind="user", id=uuid.uuid4()))
+    run = runtime.create_run(compiled_plan=_plan(revision_id), owner_scope=OwnerScope(kind="user", id=TEST_USER_ID))
     with factory() as session:
         node_id = session.scalar(
             select(NodeRunModel.node_run_id).where(NodeRunModel.run_id == run.run_id)
@@ -119,14 +126,14 @@ def test_worker_claims_one_durable_attempt_and_unknown_is_not_blindly_requeued()
     factory = get_session_factory()
     workflow_id, revision_id = uuid.uuid4(), uuid.uuid4()
     with factory.begin() as session:
-        session.add(WorkflowModel(workflow_id=workflow_id, owner_scope="user:test"))
+        session.add(WorkflowModel(workflow_id=workflow_id, owner_scope=f"user:{TEST_USER_ID}"))
         session.add(WorkflowRevisionModel(
             revision_id=revision_id, workflow_id=workflow_id, revision_number=1,
             graph_hash="g", execution_hash="e", registry_snapshot_id=uuid.uuid4(),
             revision_status=RevisionStatus.ACTIVE,
         ))
     runtime = RuntimeService(session_factory=factory)
-    run = runtime.create_run(compiled_plan=_plan(revision_id), owner_scope=OwnerScope(kind="user", id=uuid.uuid4()))
+    run = runtime.create_run(compiled_plan=_plan(revision_id), owner_scope=OwnerScope(kind="user", id=TEST_USER_ID))
     runtime.start_run(run.run_id)
     with factory() as session:
         node_id = session.scalar(select(NodeRunModel.node_run_id).where(NodeRunModel.run_id == run.run_id))
@@ -163,14 +170,14 @@ def test_expired_waiting_external_submission_becomes_unknown_without_new_dispatc
     factory = get_session_factory()
     workflow_id, revision_id = uuid.uuid4(), uuid.uuid4()
     with factory.begin() as session:
-        session.add(WorkflowModel(workflow_id=workflow_id, owner_scope="user:test"))
+        session.add(WorkflowModel(workflow_id=workflow_id, owner_scope=f"user:{TEST_USER_ID}"))
         session.add(WorkflowRevisionModel(
             revision_id=revision_id, workflow_id=workflow_id, revision_number=1,
             graph_hash="g", execution_hash="e", registry_snapshot_id=uuid.uuid4(),
             revision_status=RevisionStatus.ACTIVE,
         ))
     runtime = RuntimeService(session_factory=factory)
-    run = runtime.create_run(compiled_plan=_plan(revision_id), owner_scope=OwnerScope(kind="user", id=uuid.uuid4()))
+    run = runtime.create_run(compiled_plan=_plan(revision_id), owner_scope=OwnerScope(kind="user", id=TEST_USER_ID))
     runtime.start_run(run.run_id)
     worker = RuntimeWorker(factory)
     claim = worker.claim_next_attempt("worker-a", run_id=run.run_id)
@@ -424,6 +431,21 @@ def test_subworkflow_executes_typed_mapping_and_returns_pinned_child_output() ->
         "workflow_revision_id": str(child_revision), "depth": 1, "max_depth": 2, "max_child_nodes": 10,
         "budget_limit": 4, "input_mapping": input_mapping, "output_mapping": output_mapping,
     }}], "edges": []}
+    # The Foundation contract says a denied cross-owner ArtifactRef must
+    # be rejected even when the caller's Pydantic shape carries a
+    # different (legal) graph.  The persistent ``plan_json`` is the
+    # durable execution contract; seeding it with the foreign artifact
+    # proves the durable boundary fires regardless of caller shape.
+    denied_persisted_graph = {"nodes": [{"id": "call", "type": "subworkflow_call", "config": {
+        "workflow_revision_id": str(child_revision), "depth": 1, "max_depth": 2, "max_child_nodes": 10,
+        "budget_limit": 4, "input_mapping": {
+            "world": {"source_port": "world", "target_port": "world", "schema_id": "world",
+                      "schema_version": 1, "artifact_version_id": str(foreign_artifact)},
+        }, "output_mapping": output_mapping,
+    }}], "edges": []}
+    denied_parent_plan = CompiledExecutionPlan(plan_id=uuid.uuid4(), workflow_revision_id=parent_revision,
+        registry_snapshot=RegistrySnapshot(snapshot_id=parent_snapshot), resolved_graph=parent_graph,
+        capability_snapshots=["atlas.llm"], budget_limits={"max_cost": 5}, plan_hash="parent-denied")
     parent_plan = CompiledExecutionPlan(plan_id=uuid.uuid4(), workflow_revision_id=parent_revision,
         registry_snapshot=RegistrySnapshot(snapshot_id=parent_snapshot), resolved_graph=parent_graph,
         capability_snapshots=["atlas.llm"], budget_limits={"max_cost": 5}, plan_hash="parent-typed")
@@ -451,9 +473,11 @@ def test_subworkflow_executes_typed_mapping_and_returns_pinned_child_output() ->
         session.add_all([
             ResourceGrantSnapshotModel(grant_snapshot_id=uuid.uuid4(), resource_revision_id=resource_revision_id,
                 grantee_scope=f"user:{owner_id}", status="active"),
-            CompiledExecutionPlanModel(plan_id=parent_plan.plan_id, workflow_revision_id=parent_revision,
-                registry_snapshot_id=parent_snapshot, status="succeeded", plan_hash=parent_plan.plan_hash,
-                compiler_version="1", plan_json=parent_plan.model_dump(mode="json"), diagnostics=[]),
+            CompiledExecutionPlanModel(plan_id=denied_parent_plan.plan_id, workflow_revision_id=parent_revision,
+                registry_snapshot_id=parent_snapshot, status="succeeded", plan_hash=denied_parent_plan.plan_hash,
+                compiler_version="1",
+                plan_json={**denied_parent_plan.model_dump(mode="json"), "resolved_graph": denied_persisted_graph},
+                diagnostics=[]),
             CompiledExecutionPlanModel(plan_id=child_plan.plan_id, workflow_revision_id=child_revision,
                 registry_snapshot_id=child_snapshot, status="succeeded", plan_hash=child_plan.plan_hash,
                 compiler_version="1", plan_json=child_plan.model_dump(mode="json"), diagnostics=[]),
@@ -462,14 +486,8 @@ def test_subworkflow_executes_typed_mapping_and_returns_pinned_child_output() ->
     # This travels through the same child-run materialisation path as a real
     # request.  A bare foreign ArtifactVersion is never a substitute for a
     # fixed, granted ResourceRevision.
-    denied_graph = deepcopy(parent_graph)
-    denied_graph["nodes"][0]["config"]["input_mapping"] = {
-        "world": {"source_port": "world", "target_port": "world", "schema_id": "world", "schema_version": 1,
-                  "artifact_version_id": str(foreign_artifact)},
-    }
-    denied_plan = parent_plan.model_copy(update={"resolved_graph": denied_graph})
     with pytest.raises(Exception, match="Cross-owner ArtifactVersion"):
-        runtime.create_run(compiled_plan=denied_plan, owner_scope=OwnerScope(kind="user", id=owner_id), input_snapshot={"budget_limit": 5})
+        runtime.create_run(compiled_plan=denied_parent_plan, owner_scope=OwnerScope(kind="user", id=owner_id), input_snapshot={"budget_limit": 5})
     parent_run = runtime.create_run(compiled_plan=parent_plan, owner_scope=OwnerScope(kind="user", id=owner_id), input_snapshot={"budget_limit": 5})
     with factory() as session:
         binding = session.scalar(select(SubworkflowModel).where(SubworkflowModel.run_id == parent_run.run_id))

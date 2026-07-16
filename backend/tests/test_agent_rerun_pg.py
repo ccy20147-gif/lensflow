@@ -97,9 +97,13 @@ def _publish_fixed_agent_run(owner: OwnerScope, *, include_unfixed: bool = False
     workflow = workflows.create_workflow(owner_scope=owner)
     draft = workflows.get_draft(workflow.workflow_id)
     workflows.save_draft(workflow.workflow_id, graph, {}, {}, draft.graph_hash, [str(agent.revision_id)])
+    confirmed = workflows.get_draft(workflow.workflow_id)
     registry = SqlRegistryService(factory)
     snapshot, _row = registry.create_snapshot(_agent_definitions_for_graph(graph, owner))
-    revision, plan = workflows.publish_compiled_revision(workflow.workflow_id, snapshot, WorkflowCompiler())
+    revision, plan = workflows.publish_compiled_revision(
+        workflow.workflow_id, snapshot, WorkflowCompiler(),
+        expected_draft_hash=confirmed.full_draft_hash,
+    )
     runtime = RuntimeService(factory)
     run = runtime.create_run(compiled_plan=plan, owner_scope=owner, input_snapshot={"prompt": "immutable source input"})
     runtime.start_run(run.run_id)

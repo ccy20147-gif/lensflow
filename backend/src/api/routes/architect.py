@@ -5,7 +5,7 @@ from typing import Any
 from uuid import UUID
 from uuid import uuid4
 from fastapi import APIRouter, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from src.core.exceptions import ConflictError, ForbiddenError, NotFoundError, PolicyBlockedError, ValidationError_
 from src.domain.agent.architect_service import ArchitectService
 from src.api.auth import require_owner
@@ -24,15 +24,35 @@ def _owned_proposal(proposal_id: UUID, authorization: str | None) -> dict[str, A
 
 
 class CreateProposalRequest(BaseModel):
+    """Owner-confirmed WorkflowChangeProposal request.
+
+    ``base_draft_hash`` is the **full draft hash** of the WorkflowDraft
+    the owner reviewed when generating the proposal.  The field is
+    required and must be a 64-character SHA-256 token; a pure
+    ``graph_hash`` (which would be silently identical for two
+    layout-only saves) is explicitly rejected by the Pydantic schema
+    so the lifecycle cannot regress to the pre-TF-WF-004 semantics.
+    """
+
     workflow_id: UUID
-    base_draft_hash: str
-    intent: str
+    base_draft_hash: str = Field(min_length=64, max_length=64)
+    intent: str = Field(min_length=1, max_length=8_000)
 
 
 class ApplyProposalRequest(BaseModel):
-    base_draft_hash: str
-    validated_plan_hash: str
-    idempotency_key: str
+    """Owner-confirmation request for a WorkflowChangeProposal.
+
+    ``base_draft_hash`` carries the same semantics as
+    ``CreateProposalRequest.base_draft_hash``: the full WorkflowDraft
+    hash the owner reviewed.  ``validated_plan_hash`` is the rendered
+    compile-plan token the canvas displayed before the user clicked
+    confirm; the platform re-runs the host gates and refuses to apply
+    if the live evidence diverges.
+    """
+
+    base_draft_hash: str = Field(min_length=64, max_length=64)
+    validated_plan_hash: str = Field(min_length=1)
+    idempotency_key: str = Field(default="legacy-service-call", min_length=1)
 
 
 class FixtureProposalRequest(BaseModel):
@@ -51,7 +71,7 @@ async def create_test_fixture_proposal(body: FixtureProposalRequest, authorizati
     draft = SqlWorkflowService().get_draft(body.workflow_id)
     return _architect.create(
         workflow_id=body.workflow_id, owner_scope=owner.scoped_id,
-        base_draft_hash=draft.graph_hash, intent="test fixture: add brief",
+        base_draft_hash=draft.full_draft_hash, intent="test fixture: add brief",
         operations=[{"op": "add_node", "node": {"id": f"architect-fixture-brief-{uuid4().hex[:8]}", "type": "brief"}}],
     )
 

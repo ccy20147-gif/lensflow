@@ -53,7 +53,7 @@ def test_architect_applies_only_current_owner_confirmed_hash(factory):
     proposal = service.create(
         workflow_id=workflow.workflow_id,
         owner_scope=owner.scoped_id,
-        base_draft_hash=draft.graph_hash,
+        base_draft_hash=draft.full_draft_hash,
         intent="add a typed node",
         operations=[{"op": "add_node", "node": {"id": "idea", "type": node_type}}],
     )
@@ -62,20 +62,20 @@ def test_architect_applies_only_current_owner_confirmed_hash(factory):
         service.apply(
             proposal_id=UUID(proposal["proposal_id"]),
             owner_scope=owner.scoped_id,
-            base_draft_hash=draft.graph_hash,
+            base_draft_hash=draft.full_draft_hash,
             validated_plan_hash="bad",
         )
     applied = service.apply(
         proposal_id=UUID(proposal["proposal_id"]),
         owner_scope=owner.scoped_id,
-        base_draft_hash=draft.graph_hash,
+        base_draft_hash=draft.full_draft_hash,
         validated_plan_hash=proposal["validation"]["validated_plan_hash"],
     )
     assert applied["state"] == "applied"
     assert applied["approval"]["idempotency_key"] == "legacy-service-call"
     assert service.apply(
         proposal_id=UUID(proposal["proposal_id"]), owner_scope=owner.scoped_id,
-        base_draft_hash=draft.graph_hash,
+        base_draft_hash=draft.full_draft_hash,
         validated_plan_hash=proposal["validation"]["validated_plan_hash"],
     )["applied_draft_hash"] == applied["applied_draft_hash"]
     assert workflows.get_draft(workflow.workflow_id).graph["nodes"][0]["id"] == "idea"
@@ -90,7 +90,7 @@ def test_architect_rejects_implicit_capability(factory):
         ArchitectService(factory).create(
             workflow_id=workflow.workflow_id,
             owner_scope=owner.scoped_id,
-            base_draft_hash=draft.graph_hash,
+            base_draft_hash=draft.full_draft_hash,
             intent="bad",
             operations=[{"op": "add_node", "node": {"id": "x", "type": "latest"}}],
         )
@@ -113,13 +113,13 @@ def test_architect_patch_cannot_remove_required_human_gate(factory):
     service = ArchitectService(factory)
     proposal = service.create(
         workflow_id=workflow.workflow_id, owner_scope=owner.scoped_id,
-        base_draft_hash=draft.graph_hash, intent="remove safety gate",
+        base_draft_hash=draft.full_draft_hash, intent="remove safety gate",
         operations=[{"op": "remove_node", "node_id": "policy-gate"}],
     )
     with pytest.raises(ConflictError):
         service.apply(
             proposal_id=UUID(proposal["proposal_id"]), owner_scope=owner.scoped_id,
-            base_draft_hash=draft.graph_hash,
+            base_draft_hash=draft.full_draft_hash,
             validated_plan_hash=proposal["validation"]["validated_plan_hash"],
         )
     assert workflows.get_draft(workflow.workflow_id).graph["nodes"][0]["id"] == "policy-gate"
@@ -146,13 +146,13 @@ def test_architect_apply_persists_current_budget_and_material_validation(factory
     service = ArchitectService(factory)
     proposal = service.create(
         workflow_id=workflow.workflow_id, owner_scope=owner.scoped_id,
-        base_draft_hash=draft.graph_hash, intent="gated",
+        base_draft_hash=draft.full_draft_hash, intent="gated",
         operations=[{"op": "add_node", "node": {"id": "gated", "type": node_type, "config": {}}}],
     )
     with pytest.raises(ConflictError):
         service.apply(
             proposal_id=UUID(proposal["proposal_id"]), owner_scope=owner.scoped_id,
-            base_draft_hash=draft.graph_hash,
+            base_draft_hash=draft.full_draft_hash,
             validated_plan_hash=proposal["validation"]["validated_plan_hash"],
         )
     persisted = service.latest(UUID(proposal["proposal_id"]))
@@ -195,7 +195,7 @@ def test_architect_generate_uses_fixed_agent_invoke_not_client_operations(factor
 
     invocations = AgentInvocationService(factory, adapter=AtlasCloudAdapter(transport=FakeTransport(), api_key="test", base_url="https://atlas.test"))
     result = ArchitectService(factory, invocation_service=invocations).generate(
-        workflow_id=workflow.workflow_id, owner_scope=owner.scoped_id, base_draft_hash=draft.graph_hash,
+        workflow_id=workflow.workflow_id, owner_scope=owner.scoped_id, base_draft_hash=draft.full_draft_hash,
         intent="add a brief", node_run_attempt_id=_attempt(factory, owner),
     )
     assert result["generation"]["agent_revision_id"]
@@ -219,7 +219,7 @@ def test_architect_intent_creates_server_owned_isolated_attempt(factory):
     ))
     result = ArchitectService(factory, invocation_service=invocations).generate_from_intent(
         workflow_id=workflow.workflow_id, owner_scope=owner.scoped_id,
-        base_draft_hash=draft.graph_hash, intent="add a brief",
+        base_draft_hash=draft.full_draft_hash, intent="add a brief",
     )
     assert result["operations"][0]["node"]["id"] == "intent-typed"
     with factory() as session:
@@ -240,7 +240,7 @@ def test_architect_intent_without_provider_does_not_materialize_run(factory, mon
     with pytest.raises(PolicyBlockedError):
         ArchitectService(factory).generate_from_intent(
             workflow_id=workflow.workflow_id, owner_scope=owner.scoped_id,
-            base_draft_hash=draft.graph_hash, intent="add a brief",
+            base_draft_hash=draft.full_draft_hash, intent="add a brief",
         )
     with factory() as session:
         assert session.query(WorkflowRunModel).count() == before

@@ -226,3 +226,39 @@ class MapItemStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+
+
+# ---------------------------------------------------------------------------
+# Storage & lifecycle (TF-OPS-003)
+# ---------------------------------------------------------------------------
+
+
+class BlobStatus(StrEnum):
+    """Stable lifecycle of a Blob row.
+
+    Order is significant: rows only move forward unless explicitly reaped.
+    A Blob that is still ``uploading`` or already ``quarantined`` /
+    ``deletion_pending`` must NEVER back a published ArtifactVersion.
+    """
+
+    UPLOADING = "uploading"
+    AVAILABLE = "available"
+    QUARANTINED = "quarantined"
+    DELETION_PENDING = "deletion_pending"
+    DELETED = "deleted"
+
+
+class UploadSessionStatus(StrEnum):
+    INITIATED = "initiated"
+    UPLOADING = "uploading"
+    VERIFYING = "verifying"
+    COMPLETED = "completed"
+    ABORTED = "aborted"
+    EXPIRED = "expired"
+
+
+class LifecycleAction(StrEnum):
+    DELETE = "delete"
+    ARCHIVE = "archive"
+    MIGRATE = "migrate"
+    QUARANTINE = "quarantine"

@@ -192,7 +192,11 @@ def test_publication_requires_compilation_and_persists_plan() -> None:
     workflow = workflows.create_workflow(owner_scope=owner)
     draft = workflows.get_draft(workflow.workflow_id)
     workflows.save_draft(workflow.workflow_id, {"nodes": [{"id": "gate", "type": "human_gate"}], "edges": []}, {}, {}, draft.graph_hash)
-    revision, plan = workflows.publish_compiled_revision(workflow.workflow_id, registry, WorkflowCompiler())
+    confirmed = workflows.get_draft(workflow.workflow_id)
+    revision, plan = workflows.publish_compiled_revision(
+        workflow.workflow_id, registry, WorkflowCompiler(),
+        expected_draft_hash=confirmed.full_draft_hash,
+    )
     assert plan.workflow_revision_id == revision.revision_id
     with get_session_factory()() as session:
         assert session.get(CompiledExecutionPlanModel, plan.plan_id) is not None
@@ -212,7 +216,11 @@ def test_publication_requires_compilation_and_persists_plan() -> None:
     broken = workflows.create_workflow(owner_scope=owner)
     draft = workflows.get_draft(broken.workflow_id)
     workflows.save_draft(broken.workflow_id, {"nodes": [{"id": "x", "type": "unknown"}], "edges": []}, {}, {}, draft.graph_hash)
+    broken_confirmed = workflows.get_draft(broken.workflow_id)
     with pytest.raises(CompilationError):
-        workflows.publish_compiled_revision(broken.workflow_id, registry, WorkflowCompiler())
+        workflows.publish_compiled_revision(
+            broken.workflow_id, registry, WorkflowCompiler(),
+            expected_draft_hash=broken_confirmed.full_draft_hash,
+        )
     with get_session_factory()() as session:
         assert session.query(WorkflowRevisionModel).filter_by(workflow_id=broken.workflow_id).count() == 0

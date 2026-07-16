@@ -20,8 +20,30 @@ from src.schemas.models import (
     RegistrySnapshot,
     ResourceRef,
     ArtifactRef,
+    ProviderCompilationReport,
+    ControlLayerResult_Model,
+)
+from src.domain.workflow.entitlement_gate import (
+    CapabilityDecision,
+    EntitlementSnapshot,
+    REASON_CODES,
+    scan_graph,
 )
 from src.domain.workflow.node_definition import are_ports_compatible
+
+
+# Capability outcomes mirror Master PRD §8.4 verbatim.  ``unsupported_policy``
+# is the policy value declared by a node definition's ``policy_metadata``;
+# the frozen ``outcome`` is the only value a plan may carry.
+_CAPABILITY_OUTCOME_FOR_UNSUPPORTED = {
+    "block": "blocked",
+    "degrade": "degraded",
+    "ignore_with_warning": "ignored_with_warning",
+}
+_ALLOWED_UNSUPPORTED_POLICIES = frozenset({"block", "degrade", "ignore_with_warning"})
+_ALLOWED_CAPABILITY_OUTCOMES = frozenset(
+    {"applied", "transformed", "degraded", "ignored_with_warning", "blocked"}
+)
 
 
 class CompilationError(SafeError):
@@ -57,6 +79,21 @@ class CompilationContext:
     # Omitted entries are supported by the current runtime and retain legacy
     # compatibility for platform-owned built-ins.
     executor_availability: dict[str, bool] = field(default_factory=dict)
+    # Compile-time entitlement resolver.  ``None`` means the gate is
+    # disabled, which is only safe for unit-test doubles; production
+    # callers MUST inject a SQL-backed closure (see
+    # ``compile_resolver.make_sql_entitlement_resolver``).
+    entitlement_resolver: Any = None
+    # Optional default ``unsupported_policy`` for capabilities that do
+    # not declare their own.  Per-control overrides live in
+    # ``node_definition.policy_metadata.unsupported_policy``.
+    default_unsupported_policy: str = "block"
+    # Optional, application-controlled list of ``unsupported_policy``
+    # overrides keyed by ``(node_type_id, control_id)``.  When a node
+    # declares a control the policy table is consulted first; absence
+    # falls back to the node declaration and finally to
+    # ``default_unsupported_policy``.
+    capability_policy_overrides: dict[tuple[str, str], str] = field(default_factory=dict)
 
 
 def _enrich_diagnostic(diagnostic: dict[str, Any]) -> dict[str, Any]:
@@ -256,8 +293,28 @@ class WorkflowCompiler:
         port_diag, used_converters = self._validate_port_types(nodes, edges, registry_snapshot)
         diagnostics.extend(port_diag)
         diagnostics.extend(self._validate_required_ports(nodes, edges, registry_snapshot))
-        diagnostics.extend(self._validate_budget_and_capabilities(nodes, registry_snapshot, budget_limits))
-        diagnostics.extend(self._validate_fixed_refs(resolved_input_refs or []))
+        diagnostics.extend(self._validate_budget(nodes, budget_limits))
+        # Capability matrix produces a structured ProviderCompilationReport
+        # so ``applied | transformed | degraded | ignored_with_warning |
+        # blocked`` outcomes are visible per control and node.
+        capability_outcomes, capability_diag = self._evaluate_capabilities(
+            nodes=nodes, registry_snapshot=registry_snapshot,
+            available=set(context.available_capabilities) if context else set(),
+            default_policy=(context.default_unsupported_policy if context else "block"),
+            overrides=(context.capability_policy_overrides if context else {}),
+        )
+        diagnostics.extend(capability_diag)
+        # 5. Compile-time entitlement gate (TF-WF-003 FR-8 + minimum
+        # TF-SEC-001 gate).  Re-evaluates the current decision for every
+        # cross-owner ResourceRef / ArtifactRef candidate in the resolved
+        # graph and surfaces secrets / latest markers as structured
+        # diagnostics.  Runs AFTER node validation so a missing node type
+        # does not mask the gate output.
+        entitlement_diag, entitlement_snapshots = self._evaluate_entitlement_gate(
+            context=context, graph=graph,
+            resolved_input_refs=resolved_input_refs or [],
+        )
+        diagnostics.extend(entitlement_diag)
 
         # 5. Check unreachable nodes
         reachable = self._compute_reachable(nodes, edges)
@@ -313,6 +370,10 @@ class WorkflowCompiler:
                             "remediation": "Create a new WorkflowRevision through the documented executor migration, then recompile; historical plan remains read-only.",
                         })],
                     )
+        provider_report = self._build_provider_compilation_report(
+            context=context, capability_decisions=capability_outcomes,
+            capability_snapshots=capability_snapshots, provider_policy_ref=provider_policy_ref,
+        )
         plan_hash_input = json.dumps({
             "workflow_revision_id": str(workflow_revision_id),
             "nodes": sorted(
@@ -328,6 +389,23 @@ class WorkflowCompiler:
             "policy_revisions": policy_revisions,
             "actor_scope": context.actor_scope if context is not None else "",
             "entitlement_snapshot": context.entitlement_decision if context is not None else {},
+            "entitlement_snapshots": [
+                {
+                    "canonical_target": s.canonical_target,
+                    "canonical_kind": s.canonical_kind,
+                    "decision": s.decision,
+                    "code": s.code,
+                    "source_owner": s.source_owner,
+                    "request_owner": s.request_owner,
+                    "grant_snapshot_id": str(s.grant_snapshot_id) if s.grant_snapshot_id else None,
+                    "action_scope": s.action_scope,
+                    "reason": s.reason,
+                    "evaluated_at": s.evaluated_at.isoformat(),
+                    "details": dict(s.details),
+                }
+                for s in entitlement_snapshots
+            ],
+            "provider_report": provider_report.model_dump(mode="json") if provider_report else None,
             "resolved_input_refs": [ref.model_dump(mode="json") for ref in (resolved_input_refs or [])],
             "budget_limits": budget_limits,
         }, sort_keys=True)
@@ -345,8 +423,25 @@ class WorkflowCompiler:
             provider_policy_ref=provider_policy_ref,
             capability_snapshots=capability_snapshots,
             policy_revisions=policy_revisions,
+            provider_compilation_report=provider_report,
             actor_scope=context.actor_scope if context is not None else "",
             entitlement_snapshot=dict(context.entitlement_decision) if context is not None else {},
+            entitlement_snapshots=[
+                {
+                    "canonical_target": snapshot.canonical_target,
+                    "canonical_kind": snapshot.canonical_kind,
+                    "decision": snapshot.decision,
+                    "code": snapshot.code,
+                    "source_owner": snapshot.source_owner,
+                    "request_owner": snapshot.request_owner,
+                    "grant_snapshot_id": str(snapshot.grant_snapshot_id) if snapshot.grant_snapshot_id else None,
+                    "action_scope": snapshot.action_scope,
+                    "reason": snapshot.reason,
+                    "evaluated_at": snapshot.evaluated_at.isoformat(),
+                    "details": dict(snapshot.details),
+                }
+                for snapshot in entitlement_snapshots
+            ],
             budget_limits=budget_limits,
             compiler_version=self.compiler_version,
             plan_hash=plan_hash,
@@ -428,6 +523,215 @@ class WorkflowCompiler:
             error("Condition requires an explicit default_branch")
         return errors
 
+    def _evaluate_capabilities(
+        self,
+        *,
+        nodes: list[dict[str, Any]],
+        registry_snapshot: RegistrySnapshot,
+        available: set[str],
+        default_policy: str,
+        overrides: dict[tuple[str, str], str],
+    ) -> tuple[list[CapabilityDecision], list[dict[str, Any]]]:
+        """Run the Provider capability matrix.
+
+        For every (node_type_id, control_id) declared by a definition's
+        ``policy_metadata.required_capabilities`` we emit exactly one
+        outcome from the frozen enumeration.  ``unsupported_policy`` is
+        taken from the override table first, then the definition's
+        ``policy_metadata.unsupported_policy``, then the supplied
+        default.  ``required`` controls are also surfaced as an
+        additional ``blocked`` diagnostic so the UI / activation path can
+        distinguish a hard error from a graceful degraded outcome.
+        """
+
+        decisions: list[CapabilityDecision] = []
+        diagnostics: list[dict[str, Any]] = []
+        for node in nodes:
+            node_type = str(node.get("type", ""))
+            node_id = str(node.get("id", ""))
+            definition = registry_snapshot.node_definitions.get(node_type)
+            if definition is None:
+                continue
+            metadata = definition.policy_metadata or {}
+            required_controls = metadata.get("required_capabilities") or []
+            optional_controls = metadata.get("optional_capabilities") or []
+            for control in required_controls:
+                if not isinstance(control, str):
+                    continue
+                decisions.append(self._resolve_capability_decision(
+                    node_id=node_id, control_id=control, required=True,
+                    available=available, default_policy=default_policy,
+                    overrides=overrides, node_policy=metadata.get("unsupported_policy"),
+                ))
+            for control in optional_controls:
+                if not isinstance(control, str):
+                    continue
+                decisions.append(self._resolve_capability_decision(
+                    node_id=node_id, control_id=control, required=False,
+                    available=available, default_policy=default_policy,
+                    overrides=overrides, node_policy=metadata.get("unsupported_policy"),
+                ))
+        # Emit a single diagnostic per blocked required control so the
+        # 422 response stays actionable.  ``summary_counts`` are derived
+        # from the decisions below.
+        blocked_required = [
+            d for d in decisions if d.required and d.outcome == "blocked"
+        ]
+        for decision in blocked_required:
+            diagnostics.append({
+                "severity": "error",
+                "location": f"node:{decision.control_id.split('|', 1)[0]}",
+                "code": REASON_CODES["REQUIRED_CONTROL_BLOCKED"],
+                "message": f"Required Provider control '{decision.control_id}' is not supported",
+                "remediation": "Pick a different node type or expose the missing control in the platform provider capability snapshot.",
+            })
+        return decisions, diagnostics
+
+    def _resolve_capability_decision(
+        self,
+        *,
+        node_id: str,
+        control_id: str,
+        required: bool,
+        available: set[str],
+        default_policy: str,
+        overrides: dict[tuple[str, str], str],
+        node_policy: Any,
+    ) -> CapabilityDecision:
+        """Resolve one capability outcome with the frozen enumeration."""
+
+        key = f"{node_id}|{control_id}"
+        explicit = overrides.get((node_id, control_id)) or node_policy or default_policy
+        if explicit not in _ALLOWED_UNSUPPORTED_POLICIES:
+            explicit = "block"
+        if control_id in available:
+            return CapabilityDecision(
+                control_id=key, required=required, unsupported_policy=explicit,
+                outcome="applied", reason_code="WF_CAPABILITY_APPLIED",
+            )
+        outcome = _CAPABILITY_OUTCOME_FOR_UNSUPPORTED[explicit]
+        reason_code = (
+            REASON_CODES["REQUIRED_CONTROL_BLOCKED"]
+            if outcome == "blocked"
+            else REASON_CODES["OPTIONAL_CONTROL_DEGRADED"]
+            if outcome == "degraded"
+            else REASON_CODES["OPTIONAL_CONTROL_WARNING"]
+        )
+        return CapabilityDecision(
+            control_id=key, required=required, unsupported_policy=explicit,
+            outcome=outcome, reason_code=reason_code, semantic_loss=outcome != "applied",
+        )
+
+    def _evaluate_entitlement_gate(
+        self,
+        *,
+        context: CompilationContext | None,
+        graph: dict[str, Any],
+        resolved_input_refs: list[ResourceRef | ArtifactRef],
+    ) -> tuple[list[dict[str, Any]], list[EntitlementSnapshot]]:
+        """Run the minimum TF-SEC-001 compile gate and return diagnostics.
+
+        The scanner routes every ref in the graph to the resolver; the
+        resolver is the **only** code allowed to decide allow / deny
+        because it loads the canonical rows from PostgreSQL.  When no
+        resolver is supplied the gate fails closed for every ref.
+        """
+
+        diagnostics: list[dict[str, Any]] = []
+        snapshots: list[EntitlementSnapshot] = []
+        request_owner = context.actor_scope if context else ""
+        resolver = context.entitlement_resolver if context else None
+
+        snapshots, _secrets, diag = scan_graph(
+            request_owner=request_owner, graph=graph, resolver=resolver,
+        )
+        diagnostics.extend(diag)
+
+        # Validate the explicitly supplied input refs too.  These are the
+        # values the activation path passes to the compiler; an artifact
+        # reference without a pinned version id is rejected.
+        for index, ref in enumerate(resolved_input_refs or []):
+            if isinstance(ref, ResourceRef) and not ref.revision_id:
+                diagnostics.append({
+                    "severity": "error",
+                    "location": f"input_ref:{index}",
+                    "code": "WF_INPUT_RESOURCE_REVISION_MISSING",
+                    "message": "ResourceRef must pin a fixed resource_revision_id",
+                    "remediation": "Resolve the latest marker to a fixed revision before activation.",
+                })
+            elif isinstance(ref, ArtifactRef) and not ref.artifact_version_id:
+                diagnostics.append({
+                    "severity": "error",
+                    "location": f"input_ref:{index}",
+                    "code": "WF_INPUT_ARTIFACT_VERSION_MISSING",
+                    "message": "ArtifactRef must pin a fixed artifact_version_id",
+                    "remediation": "Resolve the latest marker to a fixed version before activation.",
+                })
+        return diagnostics, snapshots
+
+    def _build_provider_compilation_report(
+        self,
+        *,
+        context: CompilationContext | None,
+        capability_decisions: list[CapabilityDecision],
+        capability_snapshots: list[str],
+        provider_policy_ref: str,
+    ) -> ProviderCompilationReport:
+        """Render the immutable ProviderCompilationReport on the plan.
+
+        ``capability_decisions`` already carries the frozen outcome
+        enumeration.  We project those into the public ``ControlLayerResult``
+        shape and surface the summary counts so the activation path and
+        UI can render degradation without re-running the compiler.
+
+        ``report_id`` is intentionally a content-derived UUID5 so the
+        immutable plan hash can stay deterministic across replays —
+        random UUIDs would make a replay of the same revision produce
+        a different plan hash and break TF-WF-003 AC-1.
+        """
+
+        summary = {
+            "applied": 0,
+            "transformed": 0,
+            "degraded": 0,
+            "ignored_with_warning": 0,
+            "blocked": 0,
+        }
+        control_results: list[ControlLayerResult_Model] = []
+        for decision in capability_decisions:
+            outcome = decision.outcome
+            if outcome not in _ALLOWED_CAPABILITY_OUTCOMES:
+                # Defence in depth — _evaluate_capabilities must already
+                # have produced only frozen outcomes, so this branch is
+                # unreachable from production code paths.
+                outcome = "applied"
+            summary[outcome] = summary.get(outcome, 0) + 1
+            node_id, _, control_id = decision.control_id.partition("|")
+            control_results.append(ControlLayerResult_Model(
+                layer_type="provider_capability",
+                control_id=control_id or decision.control_id,
+                target_shot_id=node_id or "global",
+                result=outcome,
+                reason=decision.reason_code,
+            ))
+        report_seed = "|".join(
+            sorted(f"{r.layer_type}:{r.control_id}:{r.target_shot_id}:{r.result}:{r.reason}"
+                    for r in control_results)
+        )
+        seed_ns = uuid.NAMESPACE_URL
+        actor_scope = context.actor_scope if context else "unknown"
+        report_id = uuid.uuid5(seed_ns, f"provider-report:{actor_scope}:{provider_policy_ref}:{report_seed}")
+        return ProviderCompilationReport(
+            report_id=report_id,
+            workflow_revision_id=uuid.UUID(int=0) if context is None else uuid.uuid5(
+                seed_ns, f"provider-report:{actor_scope}",
+            ),
+            provider_refs=[],
+            control_results=control_results,
+            capability_warnings=[result.control_id for result in control_results if result.result == "ignored_with_warning"],
+            blocked_controls=[result.control_id for result in control_results if result.result == "blocked"],
+        )
+
     def dry_run(
         self,
         *,
@@ -475,6 +779,8 @@ class WorkflowCompiler:
             "policy_revisions": plan.policy_revisions,
             "actor_scope": plan.actor_scope,
             "entitlement_snapshot": plan.entitlement_snapshot,
+            "entitlement_snapshots": plan.entitlement_snapshots,
+            "provider_report": plan.provider_compilation_report.model_dump(mode="json") if plan.provider_compilation_report else None,
             "resolved_input_refs": [ref.model_dump(mode="json") for ref in plan.resolved_input_refs],
             "budget_limits": plan.budget_limits,
         }, sort_keys=True)
@@ -718,34 +1024,27 @@ class WorkflowCompiler:
                     diagnostics.append({"severity": "error", "location": f"node:{node.get('id')}:port:{port.port_id}", "message": "缺少必需输入端口"})
         return diagnostics
 
-    def _validate_budget_and_capabilities(self, nodes: list[dict], registry_snapshot: RegistrySnapshot, budget: dict[str, Any]) -> list[dict]:
+    def _validate_budget(self, nodes: list[dict], budget: dict[str, Any]) -> list[dict]:
+        """Budget enforcement only.
+
+        Capability gating is owned by ``_evaluate_capabilities`` and the
+        ProviderCompilationReport so the outcome vocabulary is the
+        frozen enumeration defined in Master PRD §8.4.
+        """
         diagnostics: list[dict] = []
-        available = set(budget.get("available_capabilities", []))
         total = 0.0
         for node in nodes:
-            definition = registry_snapshot.node_definitions.get(str(node.get("type", "")))
-            if definition is None:
-                continue
-            metadata = definition.policy_metadata or {}
-            required = set(metadata.get("provider_capabilities", []))
-            if required and not required <= available:
-                diagnostics.append({"severity": "error", "location": f"node:{node.get('id')}", "message": f"Provider capability 缺失: {', '.join(sorted(required - available))}"})
-            estimate = metadata.get("cost_estimate", 0)
+            data = node.get("data") if isinstance(node.get("data"), dict) else {}
+            metadata = data.get("policy_metadata") if isinstance(data, dict) else None
+            if not isinstance(metadata, dict):
+                config = node.get("config") if isinstance(node.get("config"), dict) else {}
+                metadata = config.get("policy_metadata") if isinstance(config, dict) else None
+            estimate = metadata.get("cost_estimate") if isinstance(metadata, dict) else None
             if isinstance(estimate, (int, float)):
                 total += float(estimate)
         maximum = budget.get("max_cost")
         if isinstance(maximum, (int, float)) and total > float(maximum):
             diagnostics.append({"severity": "error", "location": "budget", "message": "预算上限不足"})
-        return diagnostics
-
-    @staticmethod
-    def _validate_fixed_refs(refs: list[ResourceRef | ArtifactRef]) -> list[dict]:
-        diagnostics: list[dict] = []
-        for index, ref in enumerate(refs):
-            if isinstance(ref, ResourceRef) and not ref.revision_id:
-                diagnostics.append({"severity": "error", "location": f"input:{index}", "message": "ResourceRef 必须固定 revision"})
-            if isinstance(ref, ArtifactRef) and not ref.artifact_version_id:
-                diagnostics.append({"severity": "error", "location": f"input:{index}", "message": "ArtifactRef 必须固定 version"})
         return diagnostics
 
     def _detect_cycles(self, nodes: list[dict], edges: list[dict]) -> list[dict]:

@@ -142,4 +142,5 @@
 
 - 已决策：WebAV 只做浏览器预览与受限短片导出，不承担 DAG、后端运行时或长片稳定编码。
 - 已决策：时间线引用不可变媒体，片段替换产生新组合修订；计划 CutRelation 与实际 EditDecision 分离，均不覆盖历史成片或反向改写 ShotPlan。
+- 已决策：TF-PLT-003 的创作闭环在 V0/V1 Core 对外只称轻量时间线预览与片段包；WebAV 导出入口、client execution binding 和完成验证继续只在本项 V1.5 Gate 后启用。
 - 开放问题：Foundation/V1.5 设备测试后冻结批准浏览器、codec preset 和内存预检阈值；5 分钟/1080p 上限只能收紧发布，放宽需新评审。

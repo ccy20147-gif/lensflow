@@ -3,6 +3,15 @@
 The Architect Agent never writes a draft.  Its typed proposal is stored as an
 immutable artifact; this service validates it, records a validation result and
 applies it only through WorkflowDraft CAS after an owner confirmation.
+
+The proposal's ``base_draft_hash`` field is **named** for back-compat with
+existing API clients, but its **semantics are the WorkflowDraft full
+draft hash** (``graph_hash | layout_hash | execution_hash | draft_version``)
+introduced in TF-WF-004 §FR-3 / TF-PLT-003 §9.  A pure layout change keeps
+``graph_hash`` constant but rotates ``full_draft_hash``; the Architect
+proposal must therefore compare and write against the full hash, not the
+graph hash, so a layout-only edit can stale an in-flight proposal
+(TF-WF-004 AC-2 / FR-10).
 """
 
 from __future__ import annotations
@@ -61,13 +70,26 @@ class ArchitectService:
         The browser never supplies graph operations.  The runtime pins the
         managed revision and AtlasCloud result before this service validates
         and stores the owner-confirmable proposal artifact.
+
+        ``base_draft_hash`` carries the **full draft hash** of the WorkflowDraft
+        the owner reviewed (see module docstring).  A pure layout move
+        rotates the full hash while leaving ``graph_hash`` constant, so
+        this CAS is the only token that detects a stale proposal after a
+        layout-only edit.
         """
         workflow = self._workflows.get_workflow(workflow_id)
         if workflow.owner_scope.scoped_id != owner_scope:
             raise ValidationError_("Only the workflow owner may create Architect proposals")
         draft = self._workflows.get_draft(workflow_id)
-        if draft.graph_hash != base_draft_hash:
-            raise ConflictError("Architect proposal base_draft_hash is stale")
+        if draft.full_draft_hash != base_draft_hash:
+            raise ConflictError(
+                "Architect proposal base_draft_hash is stale",
+                details={
+                    "expected_full_draft_hash": base_draft_hash,
+                    "current_full_draft_hash": draft.full_draft_hash,
+                    "current_draft_version": draft.draft_version,
+                },
+            )
         kind, raw_id = owner_scope.split(":", 1)
         owner = OwnerScope(kind=kind, id=UUID(raw_id))
         revision = self._managed_revision(owner_scope)
@@ -121,8 +143,15 @@ class ArchitectService:
         if workflow.owner_scope.scoped_id != owner_scope:
             raise ValidationError_("Only the workflow owner may create Architect proposals")
         draft = self._workflows.get_draft(workflow_id)
-        if draft.graph_hash != base_draft_hash:
-            raise ConflictError("Architect proposal base_draft_hash is stale")
+        if draft.full_draft_hash != base_draft_hash:
+            raise ConflictError(
+                "Architect proposal base_draft_hash is stale",
+                details={
+                    "expected_full_draft_hash": base_draft_hash,
+                    "current_full_draft_hash": draft.full_draft_hash,
+                    "current_draft_version": draft.draft_version,
+                },
+            )
         run_id, revision_id, attempt_id = uuid4(), uuid4(), uuid4()
         node_id = uuid4()
         now = datetime.now(timezone.utc)
@@ -231,8 +260,15 @@ class ArchitectService:
                 "Only the workflow owner may create Architect proposals"
             )
         draft = self._workflows.get_draft(workflow_id)
-        if draft.graph_hash != base_draft_hash:
-            raise ConflictError("Architect proposal base_draft_hash is stale")
+        if draft.full_draft_hash != base_draft_hash:
+            raise ConflictError(
+                "Architect proposal base_draft_hash is stale",
+                details={
+                    "expected_full_draft_hash": base_draft_hash,
+                    "current_full_draft_hash": draft.full_draft_hash,
+                    "current_draft_version": draft.draft_version,
+                },
+            )
         self._validate_operations(operations)
         proposal_id = uuid4()
         payload = {
@@ -295,6 +331,22 @@ class ArchitectService:
         validated_plan_hash: str,
         idempotency_key: str = "legacy-service-call",
     ) -> dict[str, Any]:
+        """Owner-confirmed application of a proposal through the durable Draft.
+
+        ``base_draft_hash`` carries the **full draft hash** of the WorkflowDraft
+        the owner reviewed (see module docstring).  The apply path is the
+        last line of defence against an unconfirmed edit: it compares
+        against the current draft **and** against the proposal itself
+        before any Draft / Task / Artifact / ``applied`` Proposal row is
+        written.  A stale full hash on either side raises a structured
+        ``ConflictError`` and the surrounding transaction is rolled back.
+
+        The actual ``save_draft`` call uses the Pydantic-required
+        ``expected_full_draft_hash`` CAS introduced in TF-WF-004 P0 so the
+        draft is locked to the exact snapshot the user confirmed.  No
+        graph / config / layout / draft_version field is updated without
+        that token matching.
+        """
         proposal = self.latest(proposal_id)
         if proposal["owner_scope"] != owner_scope:
             raise ValidationError_("Only the proposal owner may approve it")
@@ -303,15 +355,36 @@ class ArchitectService:
             if approved_key and approved_key != idempotency_key:
                 raise ConflictError("Architect proposal was already applied with a different idempotency key")
             return proposal
+        # 1) The proposal's recorded full hash must still match the owner's
+        #    call.  ``proposal["base_draft_hash"]`` is the full draft hash
+        #    captured at create-time; a separate column would change the
+        #    persistent shape for no functional reason.
         if proposal["base_draft_hash"] != base_draft_hash:
-            raise ConflictError("Architect proposal confirmation is stale")
+            raise ConflictError(
+                "Architect proposal confirmation is stale",
+                details={
+                    "expected_full_draft_hash": base_draft_hash,
+                    "proposal_base_draft_hash": proposal["base_draft_hash"],
+                },
+            )
         workflow_id = UUID(proposal["workflow_id"])
         workflow = self._workflows.get_workflow(workflow_id)
         if workflow.owner_scope.scoped_id != owner_scope:
             raise ValidationError_("Workflow owner changed")
+        # 2) The live draft must not have moved since the owner reviewed it.
+        #    A pure layout edit between create and apply also rotates
+        #    ``full_draft_hash``, so the CAS catches layout-only races.
         draft = self._workflows.get_draft(workflow_id)
-        if draft.graph_hash != base_draft_hash:
-            raise ConflictError("Workflow draft changed after proposal validation")
+        if draft.full_draft_hash != base_draft_hash:
+            raise ConflictError(
+                "Workflow draft changed after proposal validation",
+                details={
+                    "expected_full_draft_hash": base_draft_hash,
+                    "current_full_draft_hash": draft.full_draft_hash,
+                    "current_draft_version": draft.draft_version,
+                    "current_graph_hash": draft.graph_hash,
+                },
+            )
         graph = self._apply_operations(dict(draft.graph or {}), proposal["operations"])
         # Proposal-time validation is advisory only.  Confirmation re-runs every
         # host-owned gate against the current registry, entitlement and budget
@@ -328,20 +401,29 @@ class ArchitectService:
             raise ConflictError("Architect proposal current validation is blocking", details=validation)
         if validation["validated_plan_hash"] != validated_plan_hash:
             raise ConflictError("Architect proposal validation changed; reload the confirmation report")
+        # 3) Persist the patched graph through the full CAS path.  The
+        #    draft row is locked by ``save_draft`` and the ``expected_full_draft_hash``
+        #    token is the same one we just verified.  No other field is
+        #    written; ``graph`` is the only mutable payload and
+        #    ``config``/``layout`` come from the current draft.
         saved = self._workflows.save_draft(
             workflow_id,
             graph,
             dict(draft.config or {}),
             dict(draft.layout or {}),
             base_draft_hash,
+            expected_full_draft_hash=base_draft_hash,
         )
         applied = dict(proposal)
         applied["state"] = "applied"
-        applied["applied_draft_hash"] = saved.graph_hash
+        applied["applied_draft_hash"] = saved.full_draft_hash
+        applied["applied_graph_hash"] = saved.graph_hash
+        applied["applied_draft_version"] = saved.draft_version
         applied["approval"] = {
             "owner_scope": owner_scope,
             "idempotency_key": idempotency_key,
             "applied_at": datetime.now(timezone.utc).isoformat(),
+            "applied_full_draft_hash": saved.full_draft_hash,
         }
         return self._append(proposal_id, applied)
 

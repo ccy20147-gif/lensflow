@@ -1,4 +1,4 @@
-# ToonFlow FR/AC 实施矩阵 — 2026-07-12 开发跟踪
+# LensFlow FR/AC 实施矩阵 — 2026-07-12 开发跟踪
 
 > 本节覆盖 master.md 3.1 + 3.2 共24份PRD的全部FR与AC。
 > 状态值: ready | in_progress | implemented | verified | blocked

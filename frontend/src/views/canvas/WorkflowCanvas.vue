@@ -8,7 +8,7 @@ import { MiniMap } from '@vue-flow/minimap'
 import RegistryNode from './RegistryNode.vue'
 import { catalogNodeAvailable, catalogNodeCompatible, draftNodeToCanvasNode, filterCatalog, isUnknownDefinition, layoutPositions, portsCompatible, serializeCanvasNode, type CanvasCatalogNode, type CanvasPortDef } from './canvasRegistry'
 import { useProjectStore } from '@/stores/project'
-import { apiGet, apiPost, apiPut, publishWorkflowRevision, startWorkflowRun } from '@/api/client'
+import { apiGet, apiPost, apiPut, getDraft as apiGetDraft, publishWorkflowRevision, startWorkflowRun } from '@/api/client'
 import { discardDraft, queueDraft, takeDraft } from './offlineDraftQueue'
 import { inspectorPlugin } from './inspectorPlugins'
 
@@ -25,6 +25,7 @@ const edges = ref<any[]>([])
 const catalogNodes = ref<CatalogNode[]>([])
 const selectedNode = ref<any | null>(null)
 const currentGraphHash = ref('')
+const currentFullDraftHash = ref('')
 const draftVersion = ref(0)
 const saving = ref(false)
 const saveError = ref('')
@@ -204,6 +205,7 @@ async function loadDraft(wfId: string) {
       targetHandle: e.targetHandle,
     }))
     currentGraphHash.value = (draft as any).graph_hash || ''
+    currentFullDraftHash.value = (draft as any).full_draft_hash || ''
     draftVersion.value = (draft as any).draft_version || 0
     resetHistory()
   } catch { saveError.value = '无法加载工作流草稿。请检查网络后重试。' }
@@ -348,6 +350,12 @@ async function saveDraft() {
       config: {},
       layout: { nodes: positions },
       base_graph_hash: currentGraphHash.value,
+      // Full-draft CAS tokens protect against the layout-only race
+      // (two tabs moving the same node would collide on
+      // ``currentGraphHash`` and the durable backend would silently
+      // accept both saves).
+      expected_draft_version: draftVersion.value || undefined,
+      expected_full_draft_hash: currentFullDraftHash.value || undefined,
       pinned_dependency_revisions: [],
     }
     if (typeof window !== 'undefined' && !globalThis.navigator.onLine) {
@@ -357,9 +365,10 @@ async function saveDraft() {
     }
     const result = await apiPut<any>(`/workflows/${workflowId}/draft`, payload)
     currentGraphHash.value = result.graph_hash || ''
+    currentFullDraftHash.value = result.full_draft_hash || ''
     draftVersion.value = result.draft_version || 0
   } catch (e: any) {
-    await queueDraft({ workflowId, payload: { graph: { nodes: nodes.value.map(serializeCanvasNode), edges: edges.value }, config: {}, layout: { nodes: Object.fromEntries(nodes.value.map((node) => [node.id, node.position])) }, base_graph_hash: currentGraphHash.value, pinned_dependency_revisions: [] }, queuedAt: Date.now() })
+    await queueDraft({ workflowId, payload: { graph: { nodes: nodes.value.map(serializeCanvasNode), edges: edges.value }, config: {}, layout: { nodes: Object.fromEntries(nodes.value.map((node) => [node.id, node.position])) }, base_graph_hash: currentGraphHash.value, expected_draft_version: draftVersion.value || undefined, expected_full_draft_hash: currentFullDraftHash.value || undefined, pinned_dependency_revisions: [] }, queuedAt: Date.now() })
     saveError.value = e?.status === 409
       ? 'CAS 冲突：其他用户已修改此工作流，请刷新页面重试。'
       : e?.message ?? '保存失败'
@@ -393,7 +402,19 @@ async function publishAndRun() {
   runStatus.value = ''
   try {
     await saveDraft()
-    const revision = await publishWorkflowRevision(workflowId)
+    // Re-read the draft to obtain the owner-confirmed full_draft_hash
+    // the activation requires.  draft_version is NOT a substitute:
+    // two layout-only saves share a version delta of one but
+    // produce different full hashes, so the backend must see the
+    // exact 64-character token the owner reviewed.
+    const confirmed = await apiGetDraft(workflowId)
+    if (!confirmed?.full_draft_hash) {
+      runStatus.value = '无法读取当前 Draft 的 full_draft_hash；请刷新后重试。'
+      return
+    }
+    const revision = await publishWorkflowRevision(workflowId, {
+      expected_full_draft_hash: confirmed.full_draft_hash,
+    })
     const run = await startWorkflowRun(revision.revision_id)
     runStatus.value = `已启动运行 ${run.run_id}`
   } catch (e: any) {
@@ -420,7 +441,11 @@ async function generateArchitectProposal() {
   try {
     const proposal: any = await apiPost('/architect/proposals', {
       workflow_id: workflowId,
-      base_draft_hash: currentGraphHash.value,
+      // base_draft_hash is the WorkflowDraft full hash the owner
+      // reviewed (graph + layout + execution + draft_version).  A pure
+      // layout move rotates this value; passing the graph hash would
+      // silently let a stale proposal through.
+      base_draft_hash: currentFullDraftHash.value,
       intent: architectIntent.value.trim(),
     })
     if (proposal.state === 'unknown') {
@@ -442,7 +467,10 @@ async function applyArchitectProposal() {
   architectError.value = ''
   try {
     const result: any = await apiPost(`/architect/proposals/${architectDiff.value.proposal_id}/apply`, {
-      base_draft_hash: currentGraphHash.value,
+      // Confirmation carries the same full hash the owner reviewed at
+      // generate-time.  A concurrent layout edit on another tab rotates
+      // this value; the platform refuses the apply with 409.
+      base_draft_hash: currentFullDraftHash.value,
       validated_plan_hash: architectDiff.value.validation?.validated_plan_hash,
       idempotency_key: `architect-apply:${architectDiff.value.proposal_id}:${architectDiff.value.validation?.validated_plan_hash}`,
     })

@@ -90,15 +90,24 @@ async def test_compile_reports_missing_pinned_snapshot(client: tuple[WorkflowSer
 
 
 @pytest.mark.asyncio
-async def test_dry_run_returns_compiler_diagnostics_for_draft(client: tuple[WorkflowService, RegistryService]) -> None:
+async def test_dry_run_requires_active_revision(client: tuple[WorkflowService, RegistryService]) -> None:
+    """TF-WF-003 FR-1: the dry-run preview refuses a mutable draft.
+
+    Before any owner-confirmed activation, the workflow has no active
+    revision; the preview must surface a structured refusal so the
+    canvas cannot iterate against an unauthorised plan hash.
+    """
     workflows, registry = client
     workflow = workflows.create_workflow(owner_scope=TEST_OWNER)
     _active_snapshot(registry)
 
     response = await api_request("POST", f"/api/v1/workflows/{workflow.workflow_id}/compile/dry-run")
     assert response.status_code == 200
-    assert response.json()["passes"] is False
-    assert response.json()["diagnostics"][0]["location"] == "graph"
+    body = response.json()
+    assert body["passes"] is False
+    diagnostic = body["diagnostics"][0]
+    assert diagnostic["location"] == "compile_input"
+    assert "ACTIVE Revision" in diagnostic["message"]
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-# ToonFlow PRD 开发交付跟踪表
+# LensFlow PRD 开发交付跟踪表
 
 > 文档 ID：TF-DELIVERY-TRACKER-001
 > 状态：active
@@ -14,15 +14,16 @@
 
 | 指标 | 当前值 |
 | --- | --- |
-| PRD 总数 | 61 |
-| defined | 34 |
-| in_delivery | 24 |
+| PRD 总数 | 62 |
+| defined | 32 |
+| reviewed | 1 |
+| in_delivery | 23 |
 | deferred | 3 |
-| 已指派个人 DRI | 24 (main-agent) |
+| 已指派个人 DRI | 27 (main-agent) |
 | implemented | 0 |
-| verified | 0 |
+| verified | 3 |
 | released | 0 |
-| 已完成 `[x]` | 0 |
+| 已完成 `[x]` | 3 |
 
 ## 3. PRD 跟踪表
 
@@ -36,6 +37,7 @@
 | `TF-ARC-002.md` | Foundation | 产品架构/前端架构 | main-agent | in_delivery | [ ] | 产品分层 ADR + Vue 路由骨架 | ADR-002, frontend/src/router.ts |
 | `TF-PLT-001.md` | V0 -> V1 Core | 平台产品/身份后端 | main-agent | in_delivery | [ ] | 身份服务实现（bootstrap/注册/登录/会话） | identity_service.py, session_service.py, test_identity.py (24 tests) |
 | `TF-PLT-002.md` | V0 | 核心产品/前端平台 | main-agent | in_delivery | [ ] | 项目外壳 + 资源库实现 | project_service.py, resource_library.py, test_project.py (18 tests) |
+| `TF-PLT-003.md` | V0 -> V1 Core | 核心产品/前端平台/工作流平台/资源平台 | main-agent | reviewed | [ ] | 用户已冻结产品决策；进入 approved 前同步受影响 PRD 的公共合同与认领卡 | multi-agent UI/UX、前端、后端/领域架构评审；`requirements/TF-PLT-003.md` |
 | `TF-QLT-001.md` | Foundation -> V1 Core | QA/AI 评测 | main-agent | in_delivery | [ ] | 六类测试套件框架 + 质量评估服务 | docs/quality/foundation-test-suite.md, quality_service.py |
 
 ### 3.2 工作流、Agent 与 Media Recipe
@@ -44,10 +46,10 @@
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `TF-WF-001.md` | V1 Core | 工作流前端 | main-agent | in_delivery | [ ] | Vue Flow 画布 + 节点库 + Inspector | WorkflowCanvas.vue, nodeRegistry.ts |
 | `TF-WF-002.md` | Foundation | 工作流平台 | main-agent | in_delivery | [ ] | 节点注册表 + RegistrySnapshot 实现 | registry_service.py, node_definition.py, test_registry.py |
-| `TF-WF-003.md` | Foundation | 工作流平台/安全 | main-agent | in_delivery | [ ] | 编译器实现（图校验/类型检查/环检测/hash） | compiler.py, test_compiler.py (9 tests) |
-| `TF-WF-004.md` | Foundation -> V0 -> V1 Core | 工作流平台 | main-agent | in_delivery | [ ] | Draft/Revision 服务 + hash 计算 | workflow_service.py, draft_revision.py, test_workflow.py (20 tests) |
-| `TF-WF-005.md` | Foundation | 数据平台/工作流平台 | main-agent | in_delivery | [ ] | Artifact/Resource/Revision CRUD + 跨 owner 检查 | artifact_service.py, resource_service.py, test_artifact.py |
-| `TF-WF-006.md` | Foundation -> V0 -> V1 Core | 运行时平台 | main-agent | in_delivery | [ ] | Runtime 服务（Attempt/epoch/outbox/provider/human） | runtime_service.py, test_runtime.py (10 tests) |
+| `TF-WF-003.md` | Foundation | 工作流平台/安全 | main-agent | verified | [x] | 已独立验收；解锁持久运行与模板编译 | `compiler.py`, `entitlement_gate.py`, `compile_resolver.py`; PostgreSQL 专项/依赖回归 143 passed（2026-07-16） |
+| `TF-WF-004.md` | Foundation -> V0 -> V1 Core | 工作流平台 | main-agent | verified | [x] | 已独立验收；后续依赖可进入实施 | `workflow_service.py`, `draft_revision.py`, `sql_workflow_service.py`, `architect_service.py`; PostgreSQL/API/Architect 专项 34 passed（2026-07-15）；前端 typecheck/test/build 通过 |
+| `TF-WF-005.md` | Foundation | 数据平台/工作流平台 | main-agent | verified | [x] | 已独立验收；解锁编译与下游资源合同 | `artifact_repository.py`, `resource_repository.py`, `blob_service.py`; PostgreSQL 专项/回归 91 passed（2026-07-16） |
+| `TF-WF-006.md` | Foundation -> V0 -> V1 Core | 运行时平台 | main-agent | in_delivery | [ ] | Foundation 已独立验收；V0 最小持久运行与 V1 lease/复杂恢复待交付 | `runtime_service.py`, `worker.py`; PostgreSQL 运行时/回调/局部重跑专项 45 passed，迁移 `8c9d0e1f2a3b`（2026-07-16） |
 | `TF-WF-007.md` | V1 Core | 运行时平台 | main-agent | in_delivery | [ ] | 控制流节点（Condition/Join/Fallback/Map/Fold） | models.py 中相关类型定义 |
 | `TF-WF-008.md` | V1 Core | 运行时平台/核心产品 | main-agent | in_delivery | [ ] | Human Gate + RequestInput 持久化 | runtime_service.py, models.py |
 | `TF-WF-009.md` | V0 -> V1 Core | 模板产品/工作流平台 | main-agent | in_delivery | [ ] | 模板服务（PackageManifest/依赖/实例化） | template_service.py, test_template.py (16 tests) |
@@ -105,12 +107,12 @@
 
 | PRD | 目标版本 | 责任域 | 个人 DRI | 状态 | 完成 | 下一动作/阻塞 | 证据索引 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `TF-OPS-001.md` | Foundation -> V1 Core | Provider 平台/安全 | 待认领 | defined | [ ] | F3 做合同/spike，WF-006 后关闭 | - |
+| `TF-OPS-001.md` | Foundation -> V1 Core | Provider 平台/安全 | 待认领 | in_delivery | [ ] | Foundation 已独立验收；真实 Provider spike、健康、fallback、轮换与 V1 矩阵待交付 | `runtime_service.py`, `worker.py`; PostgreSQL provider/outbox 专项 45 passed，迁移 `8c9d0e1f2a3b`；真实凭证 gate 未关闭（2026-07-16） |
 | `TF-OPS-002.md` | V0 -> V1 Core | FinOps/运行时 | 待认领 | defined | [ ] | 等待身份、编译、运行时和 Provider 合同 | - |
-| `TF-OPS-003.md` | Foundation -> V0 | 存储平台 | 待认领 | defined | [ ] | 冻结 Blob/Storage ADR | - |
+| `TF-OPS-003.md` | Foundation -> V0 | 存储平台 | main-agent | in_delivery | [ ] | Foundation 已验证；V0 仍需真实对象存储、私有签名读取与分片/断点续传 | `blob_service.py`, `storage.py`; PostgreSQL 专项/回归 91 passed（2026-07-16） |
 | `TF-OPS-004.md` | V0 -> V1 Core | 事件平台 | 待认领 | defined | [ ] | 等待 PLT-001、WF-006 | - |
 | `TF-OPS-005.md` | Foundation | SRE/安全工程 | 待认领 | defined | [ ] | 冻结 Observability/Audit ADR | - |
-| `TF-SEC-001.md` | Foundation -> V0 -> V1 Core | Trust & Safety | 待认领 | defined | [ ] | 冻结策略合同 | - |
+| `TF-SEC-001.md` | Foundation -> V0 -> V1 Core | Trust & Safety | main-agent | in_delivery | [ ] | Foundation 编译 entitlement gate 已验证；同意、审核、撤回、披露与导出待交付 | `entitlement_gate.py`, `compile_resolver.py`; 跨 owner 编译攻击路径已验收（2026-07-16） |
 | `TF-NFR-001.md` | V0 -> V1 Core | 前端平台/QA | 待认领 | defined | [ ] | 冻结参考设备基线 | - |
 | `TF-NFR-002.md` | V1 Core | 数据平台/SRE/法务 | 待认领 | defined | [ ] | 冻结保留期 | - |
 

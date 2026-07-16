@@ -7,7 +7,7 @@
 
 ## 概述
 
-本文件定义 ToonFlow Foundation 层的六类质量评测套件。每类套件包含固定样本、适用范围、critical failure 规则和自动指标门槛。
+本文件定义 LensFlow Foundation 层的六类质量评测套件。每类套件包含固定样本、适用范围、critical failure 规则和自动指标门槛。
 
 六类套件覆盖：
 

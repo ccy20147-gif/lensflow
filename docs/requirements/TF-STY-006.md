@@ -120,4 +120,5 @@
 - 已决策：本项输出结构化剧本而非镜头或媒体；来源 span、人物和世界约束必须保留。
 - 已决策：新桥段允许存在，但必须显式标记并经用户确认。
 - 已决策：V1 项目 owner-only；生成运行只产出 ArtifactVersion，ScreenplayRevision 由工作台提交后的 workflow-owned ResourceCommit 创建。
+- 已决策：V1 Screenplay 完全私有，不提供社区 Listing、搜索、引用、派生，也不得包装为只读 CreativeWork 或通过 Workflow Template 内嵌泄漏；固定版本的私人创作入口遵守 TF-PLT-003。
 - 开放问题：无阻塞 V1 Core 的开放问题。

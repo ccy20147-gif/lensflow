@@ -1,4 +1,4 @@
-# ToonFlow 开放创作平台产品需求总指导与跟踪表
+# LensFlow 开放创作平台产品需求总指导与跟踪表
 
 > 文档 ID：TF-PRD-MASTER-001  
 > 状态：产品范围与公共合同已完成主代理验收；开发准备门已建立，待团队认领与逐项批准  
@@ -27,6 +27,12 @@
 
 以下结论不再留给详细需求文档自行选择：
 
+- 产品对用户展示的名称统一为 LensFlow；历史 `TF-*` 需求 ID、已应用数据库迁移、审计证据和不可变 `toonflow.*` schema 不改写，新 schema 使用 `lensflow.*` 并保留兼容解析。
+- 产品信息架构采用“创作资产库 + 项目工作室”双轴：Workflow 画布、World、Character OC 和私有 Screenplay 在浏览与“从此创作”心智上平级，但 Workflow 与 Resource 的 canonical 类型、Draft/Revision 和运行语义不得合并。
+- Workflow 是可命名、检索、克隆和版本化的私有创作对象，但每个可变 WorkflowDraft 只能属于一个可编辑 Project；Resource 可被多个 Project 固定引用。
+- 节点运行结果默认是 ArtifactVersion；只有用户从准确 OutputBinding/SelectionRecord 显式保存时，才能事务性提升为 ResourceRevision。不得默认批量提升或把索引投影当作内容真相。
+- V1 Screenplay 完全私有，不提供社区 Listing、搜索、引用、派生，也不得包装为只读 CreativeWork 或通过工作流模板泄漏。
+- 消费社区后置；在没有真实只读内容和授权闭环前，社区导航必须隐藏，不得提供空搜索、假内容或可点击失败动作。
 - 新建独立 FastAPI 后端；SeedV 仅提供领域流程、Schema、可靠执行和生产经验参考，不作为代码或数据库基础。
 - 新建 Vue 3 + Vue Flow 开放工作流前端；Toonflow 仅作为交互参考和经授权、经解耦的组件供体。
 - 任何 Toonflow 或其他第三方代码、视觉资产、品牌元素和组件复用必须先通过来源与许可 Gate；未通过时采用 clean-room 重写，不阻塞独立核心建设。
@@ -161,6 +167,7 @@ discovered -> defined -> reviewed -> approved -> in_delivery
 | TF-ARC-002 | 分层创作架构与工作区 | 产品外壳/创作空间 | Foundation | P0 | 工作区、业务画布、领域工作台、配方实验室和运行内核职责不得混淆 | 导航、数据流和跨层调用合同通过评审 | `requirements/TF-ARC-002.md` | in_delivery |
 | TF-PLT-001 | 用户账户与项目所有权 | 产品外壳/平台内核 | V0 -> V1 Core | P0 | V0 bootstrap owner；V1 多账户私有项目；不含团队实时协作 | owner 边界、注册/登录、项目隔离、删除与权限 E2E | `requirements/TF-PLT-001.md` | in_delivery |
 | TF-PLT-002 | 项目、工作流与资源库外壳 | 产品外壳 | V0 | P0 | 一个项目可有多个工作流和资源；不把项目等同工作流 | 项目创建、切换、保存、资源检索和恢复 E2E | `requirements/TF-PLT-002.md` | in_delivery |
+| TF-PLT-003 | LensFlow 创作外壳、个人创作资产与项目关联 | 产品外壳/项目工作室/创作资产库 | V0 -> V1 Core | P0 | 资产库与项目双轴；私人 Workflow、运行产物和 Artifact 提升不制造第二真相源 | 模板/自由画布、项目关联、Run 深链、产物资产化和恢复 E2E | `requirements/TF-PLT-003.md` | reviewed |
 | TF-QLT-001 | AI、媒体与交互质量评测基线 | 全局质量治理 | Foundation -> V1 Core | P0 | 固定测试集、人工 rubric、自动指标和回归容差；不以单张样例判定质量 | 文本、身份、镜头控制、51 镜头、广告图和交互回归报告 | `requirements/TF-QLT-001.md` | in_delivery |
 
 ### 7.2 工作流与运行内核
@@ -169,10 +176,10 @@ discovered -> defined -> reviewed -> approved -> in_delivery
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | TF-WF-001 | 动态 Vue Flow 业务画布 | 主业务工作流画布 | V1 Core | P0 | 动态注册节点；不得使用固定 slot/FlowData | 新节点无需改画布主组件即可出现、连接和保存 | `requirements/TF-WF-001.md` | in_delivery |
 | TF-WF-002 | 节点注册表与强类型端口 | 平台内核 | Foundation | P0 | 类型基于 schema identity/version，不按名称或字符串前缀猜测 | 注册、兼容矩阵和错误定位 contract tests | `requirements/TF-WF-002.md` | in_delivery |
-| TF-WF-003 | 图编译、执行计划与策略校验 | 平台内核 | Foundation | P0 | 运行前冻结完整计划；禁止边运行边解释草稿 | 非法图拒绝、旧版本重放/拒绝、权限预算校验测试 | `requirements/TF-WF-003.md` | in_delivery |
-| TF-WF-004 | Workflow 草稿与不可变修订 | 主画布/平台内核 | Foundation -> V0 -> V1 Core | P0 | 画布位置与执行 hash 分离；任何运行固定 revision | 并发编辑、发布修订、运行隔离和 diff 测试 | `requirements/TF-WF-004.md` | in_delivery |
-| TF-WF-005 | Artifact、Resource 与 lineage | 平台内核/资源库 | Foundation | P0 | ArtifactVersion 是运行产物真相；World/Character 等为一等资源 | stale 传播、版本固定、来源追踪和历史读取测试 | `requirements/TF-WF-005.md` | in_delivery |
-| TF-WF-006 | 持久 DAG 执行与异步恢复 | 平台内核 | Foundation -> V0 -> V1 Core | P0 | V0 最小持久运行；V1 完成 attempt、lease、epoch、task binding、outbox 和恢复 | 失败、取消、刷新、重启、晚到 worker 和重复回调测试 | `requirements/TF-WF-006.md` | in_delivery |
+| TF-WF-003 | 图编译、执行计划与策略校验 | 平台内核 | Foundation | P0 | 运行前冻结完整计划；禁止边运行边解释草稿 | 独立验收：固定 Revision、计划、canonical owner 授权、能力报告与结构化诊断通过 | `requirements/TF-WF-003.md` | verified |
+| TF-WF-004 | Workflow 草稿与不可变修订 | 主画布/平台内核 | Foundation -> V0 -> V1 Core | P0 | 画布位置与执行 hash 分离；任何运行固定 revision | 独立验收：Draft/Proposal 完整 hash CAS、发布、运行隔离、diff 与回滚测试通过 | `requirements/TF-WF-004.md` | verified |
+| TF-WF-005 | Artifact、Resource 与 lineage | 平台内核/资源库 | Foundation | P0 | ArtifactVersion 是运行产物真相；World/Character 等为一等资源 | 独立验收：不可变版本链、CAS、lineage、stale、跨 owner 与显式提升测试通过 | `requirements/TF-WF-005.md` | verified |
+| TF-WF-006 | 持久 DAG 执行与异步恢复 | 平台内核 | Foundation -> V0 -> V1 Core | P0 | V0 最小持久运行；V1 完成 attempt、lease、epoch、task binding、outbox 和恢复 | Foundation 独立验收：固定持久 plan、epoch fencing、dispatch/result outbox、unknown、取消和 owner 绑定回归通过；V0/V1 待交付 | `requirements/TF-WF-006.md` | in_delivery |
 | TF-WF-007 | 控制流、批处理、子工作流与局部运行 | 平台内核/主画布 | V1 Core | P0 | Condition、Join、Fallback、有限 Map、OrderedMap/Fold；允许固定修订、有限深度、无递归 SubworkflowCall | 分支、缺失输入、checkpoint、调用深度、上游/下游闭包测试 | `requirements/TF-WF-007.md` | in_delivery |
 | TF-WF-008 | Human Gate 与 RequestInput | 主画布/平台内核 | V1 Core | P0 | 决策持久化；智能体可等待用户；前端弹窗不是事实源 | waiting_user、恢复、超时、重复提交和强制 gate 测试 | `requirements/TF-WF-008.md` | in_delivery |
 | TF-WF-009 | 工作流模板与依赖包 | 模板入口/平台内核 | V0 -> V1 Core | P0 | V0 内置模板；V1 完成 typed dependency、依赖闭包和替换槽；社区上架由 TF-COM-003 管理 | 内置模板复制、依赖解析、缺失/私有依赖阻断测试 | `requirements/TF-WF-009.md` | in_delivery |
@@ -240,12 +247,12 @@ discovered -> defined -> reviewed -> approved -> in_delivery
 
 | ID | 需求 | 全局位置 | 目标版本 | 优先级 | 边界摘要 | 交付证据 | 详细文档 | 状态 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| TF-OPS-001 | Provider、模型与密钥管理 | 设置/平台内核 | Foundation -> V1 Core | P0 | 密钥不进图和日志；能力快照、选择策略和实际调用记录均版本化 | provider 健康、密钥隔离、能力快照、fallback 和实际调用追踪测试 | `requirements/TF-OPS-001.md` | defined |
+| TF-OPS-001 | Provider、模型与密钥管理 | 设置/平台内核 | Foundation -> V1 Core | P0 | 密钥不进图和日志；能力快照、选择策略和实际调用记录均版本化 | Foundation 独立验收：持久 invocation、outbox dedupe、unknown 与结果事务回归通过；真实 Provider spike、健康、fallback 和轮换待交付 | `requirements/TF-OPS-001.md` | in_delivery |
 | TF-OPS-002 | 成本、配额、预算与用量 | 设置/运行内核 | V0 -> V1 Core | P0 | 运行前估算/预留，运行后实际记账；V1 可无支付 | 超预算阻断、偏差、取消和用户用量展示测试 | `requirements/TF-OPS-002.md` | defined |
-| TF-OPS-003 | 文件、Blob 与媒体资产存储 | 资源库/平台内核 | Foundation -> V0 | P0 | Foundation 冻结存储合同；V0 完成元数据/Blob 分离、私有访问和生命周期 | 上传、断点/失败、去重、签名 URL 和删除测试 | `requirements/TF-OPS-003.md` | defined |
+| TF-OPS-003 | 文件、Blob 与媒体资产存储 | 资源库/平台内核 | Foundation -> V0 | P0 | Foundation Blob/UploadSession 合同已验证；V0 继续真实对象存储与可恢复上传 | Foundation 独立验收：完整性、引用保护、生命周期与重建；V0 上传/签名读取待交付 | `requirements/TF-OPS-003.md` | in_delivery |
 | TF-OPS-004 | RunEvent、通知与任务状态 | 产品外壳/平台内核 | V0 -> V1 Core | P0 | 数据库事件是真相，SSE/WebSocket 只是投递 | after_seq 回放、重连、通知去重和状态恢复测试 | `requirements/TF-OPS-004.md` | defined |
 | TF-OPS-005 | 审计、可观测性与安全错误 | 运营/平台内核 | Foundation | P0 | 外部展示安全错误，内部保留关联 ID 和完整诊断 | 日志/指标/trace、敏感信息清理和故障定位演练 | `requirements/TF-OPS-005.md` | defined |
-| TF-SEC-001 | 权限、内容安全与素材权利 Gate | 平台内核/导出 | Foundation -> V0 -> V1 Core | P0 | Foundation 冻结策略合同；运行期可阻断高风险内容、真人肖像/声音、未成年人、无权素材和敏感资源 | 权限绕过、同意/撤回、policy gate、素材授权、披露和导出阻断测试 | `requirements/TF-SEC-001.md` | defined |
+| TF-SEC-001 | 权限、内容安全与素材权利 Gate | 平台内核/导出 | Foundation -> V0 -> V1 Core | P0 | 编译期 canonical owner/GrantSnapshot 准入门已验证；其余安全与权利能力后续交付 | 编译期跨 owner 绕过拒绝已验收；同意、撤回、审核、披露与导出待交付 | `requirements/TF-SEC-001.md` | in_delivery |
 | TF-NFR-001 | 性能、可访问性与响应式基线 | 全前端 | V0 -> V1 Core | P0 | 桌面完整编辑；移动端查看和有限操作；数值目标覆盖 50 节点、100 缩略图和 51 镜头 | 浏览器/视口矩阵、长文本、容量、延迟、键盘和无重叠视觉测试 | `requirements/TF-NFR-001.md` | defined |
 | TF-NFR-002 | 数据导出、删除、保留与灾难恢复 | 设置/平台内核 | V1 Core | P1 | 删除不得破坏被授权引用的历史证据；Blob 按策略清理 | 导出、软删/硬删、备份恢复和引用保护测试 | `requirements/TF-NFR-002.md` | defined |
 
@@ -1037,6 +1044,7 @@ Master Requirement ID
 | TF-ARC-002 | 产品架构/前端架构 | TF-GOV-001、TF-ARC-001 |
 | TF-PLT-001 | 平台产品/身份后端 | TF-ARC-001 |
 | TF-PLT-002 | 核心产品/前端平台 | TF-PLT-001、TF-WF-004、TF-WF-005、TF-OPS-003 |
+| TF-PLT-003 | 核心产品/前端平台/工作流平台/资源平台 | TF-ARC-002、TF-PLT-001、TF-PLT-002、TF-WF-004、TF-WF-005、TF-WF-006、TF-WF-009、TF-OPS-004、TF-NFR-001 |
 | TF-QLT-001 | QA/AI 评测 | TF-GOV-001、TF-OPS-005 |
 | TF-WF-001 | 工作流前端 | TF-ARC-002、TF-WF-002、TF-WF-004 |
 | TF-WF-002 | 工作流平台 | TF-ARC-001、TF-GOV-001 |
@@ -1270,3 +1278,4 @@ TF-MED-010/011 -> TF-MED-012
 | 2026-07-12 | 完成第四轮镜头工作台合同复验；收紧 Director component、Board/Grid 来源联合、工作台 patch 审计、动作板时间域与 source-video 真实 E2E 门 | 主代理已裁决，待总需求验收 |
 | 2026-07-12 | 完成全量开发准备审查；建立团队认领规则、ADR/Schema/provider/质量 Gate 和覆盖全部 PRD 的串并行顺序，并修正人类可读依赖主链 | 产品合同已验收，待逐项 DRI 认领与批准 |
 | 2026-07-12 | 增加覆盖 61 个 PRD 的开发交付跟踪表，统一 DRI、Requirement 状态、完成标记和证据索引规则 | active |
+| 2026-07-15 | 产品品牌冻结为 LensFlow；增加 TF-PLT-003，冻结创作资产库/项目工作室双轴、私人 Workflow、显式 Artifact 提升、Screenplay 完全私有和社区后置边界；需求增至 62 项 | multi-agent reviewed |

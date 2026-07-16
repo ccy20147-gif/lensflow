@@ -121,19 +121,24 @@ export const useProjectStore = defineStore('project', () => {
   }
 
   /**
-   * Save a workflow draft using compare-and-swap on `baseHash`. The
-   * backend returns 409 if the hash doesn't match, which we surface
-   * as a thrown ApiError so the caller can decide how to recover.
+   * Save a workflow draft using compare-and-swap. The backend accepts
+   * the legacy ``baseHash`` (graph hash only) for back-compat, but the
+   * canvas must always pass either ``expectedFullDraftHash`` or
+   * ``expectedDraftVersion`` so the durable path can detect a
+   * layout-only race. The backend returns 409 if the token doesn't
+   * match; the caller's caller (the canvas) is responsible for
+   * reconciling the local patch and re-reading the draft.
    */
   async function saveDraft(
     workflowId: string,
     draft: { nodes?: unknown[]; edges?: unknown[] },
     baseHash: string,
+    options: { expectedDraftVersion?: number; expectedFullDraftHash?: string } = {},
   ): Promise<WorkflowDraft> {
     loading.value = true
     error.value = null
     try {
-      const saved = await apiSaveDraft(workflowId, draft, baseHash)
+      const saved = await apiSaveDraft(workflowId, draft, baseHash, options)
       currentDraft.value = saved
       return saved
     } catch (err) {

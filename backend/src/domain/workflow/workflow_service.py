@@ -16,6 +16,7 @@ from src.schemas.enums import RevisionStatus
 from .draft_revision import (
     compute_draft_hashes,
     compute_diff,
+    compute_full_draft_hash,
     create_draft,
     create_revision,
     required_human_gate_ids,
@@ -101,22 +102,66 @@ class WorkflowService:
         layout: dict[str, Any],
         base_graph_hash: str,
         pinned_dependency_revisions: list[str] | None = None,
+        *,
+        expected_draft_version: int | None = None,
+        expected_full_draft_hash: str | None = None,
     ) -> WorkflowDraft:
-        """Save draft with compare-and-swap on base_graph_hash.
+        """Save draft with full-draft compare-and-swap.
 
         Raises:
-            ConflictError: If the current draft's graph_hash differs from
-                          base_graph_hash (another edit happened first).
+            ConflictError: If the caller's draft version/full hash does not
+                match the current draft.  Older clients that only pass
+                ``base_graph_hash`` get the legacy graph-hash-only check,
+                which is fine for graph changes but would not detect a
+                layout-only race; the durable SQL path additionally accepts
+                ``expected_draft_version`` and ``expected_full_draft_hash``
+                and prefers them.
         """
         current_draft = self.get_draft(workflow_id)
 
-        # CAS check
-        if current_draft.graph_hash != base_graph_hash:
+        # Full draft CAS, when supplied, is authoritative.
+        if expected_full_draft_hash is not None:
+            if expected_full_draft_hash != current_draft.full_draft_hash:
+                raise ConflictError(
+                    message=(
+                        f"WorkflowDraft {workflow_id} 冲突: "
+                        f"expected_full_draft_hash 不匹配当前版本"
+                    ),
+                    details={
+                        "expected_full_draft_hash": expected_full_draft_hash,
+                        "current_full_draft_hash": current_draft.full_draft_hash,
+                        "current_draft_version": current_draft.draft_version,
+                    },
+                )
+        elif expected_draft_version is not None:
+            if expected_draft_version != current_draft.draft_version:
+                raise ConflictError(
+                    message=(
+                        f"WorkflowDraft {workflow_id} 冲突: "
+                        f"expected_draft_version {expected_draft_version} "
+                        f"与当前版本 {current_draft.draft_version} 不一致"
+                    ),
+                    details={
+                        "expected_draft_version": expected_draft_version,
+                        "current_draft_version": current_draft.draft_version,
+                        "current_graph_hash": current_draft.graph_hash,
+                    },
+                )
+        elif current_draft.graph_hash != base_graph_hash:
+            # Legacy graph-hash-only path.  Pure layout changes share
+            # ``graph_hash`` and so would both pass; the durable path
+            # requires ``expected_draft_version`` or
+            # ``expected_full_draft_hash`` for that reason.
             raise ConflictError(
                 message=(
                     f"WorkflowDraft {workflow_id} 冲突: "
                     f"base_hash {base_graph_hash} 不匹配当前 {current_draft.graph_hash}"
-                )
+                ),
+                details={
+                    "expected_graph_hash": base_graph_hash,
+                    "current_graph_hash": current_draft.graph_hash,
+                    "current_draft_version": current_draft.draft_version,
+                },
             )
 
         protected = required_human_gate_ids(current_draft.graph)
@@ -134,10 +179,14 @@ class WorkflowService:
         graph_hash, layout_hash, execution_hash = compute_draft_hashes(
             graph, config, layout, pinned_dependency_revisions
         )
+        new_version = current_draft.draft_version + 1
+        full_draft_hash = compute_full_draft_hash(
+            graph_hash, layout_hash, execution_hash, new_version,
+        )
 
         new_draft = WorkflowDraft(
             workflow_id=workflow_id,
-            draft_version=current_draft.draft_version + 1,
+            draft_version=new_version,
             base_revision_id=current_draft.base_revision_id,
             graph=graph,
             config=config,
@@ -145,6 +194,7 @@ class WorkflowService:
             graph_hash=graph_hash,
             layout_hash=layout_hash,
             execution_hash=execution_hash,
+            full_draft_hash=full_draft_hash,
             updated_at=datetime.now(timezone.utc),
         )
         self._drafts[workflow_id] = new_draft

@@ -1005,6 +1005,7 @@ class RuntimeWorker:
                     event_id=uuid.uuid4(), aggregate_type="provider_invocation", aggregate_id=provider_attempt_id,
                     event_type="provider.reconcile_requested", purpose="provider_reconcile",
                     payload={"provider_id": provider.provider_id, "idempotency_key": provider.idempotency_key, "reason": reason},
+                    dedupe_key=str(provider_attempt_id),
                     created_at=datetime.now(timezone.utc),
                 ))
 

@@ -51,6 +51,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+# Stable test owner so the durable Foundation owner gate (which rejects
+# non-owner callers against a persisted WorkflowRevision) can verify
+# ownership consistently across the suite.  See TF-WF-006 FR-10 /
+# TF-OPS-001 Foundation scope.
+TEST_USER_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -72,7 +79,7 @@ def revision_id(factory) -> uuid.UUID:
     wid = uuid.uuid4()
     rid = uuid.uuid4()
     with factory.begin() as session:
-        session.add(WorkflowModel(workflow_id=wid, owner_scope="user:test"))
+        session.add(WorkflowModel(workflow_id=wid, owner_scope=f"user:{TEST_USER_ID}"))
         session.add(WorkflowRevisionModel(
             revision_id=rid, workflow_id=wid, revision_number=1,
             graph_hash="g", execution_hash="e", registry_snapshot_id=uuid.uuid4(),
@@ -100,7 +107,7 @@ def _setup_run(runtime, plan) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
     """Create a run, start it, get the node_run_id and attempt_id."""
     run = runtime.create_run(
         compiled_plan=plan,
-        owner_scope=OwnerScope(kind="user", id=uuid.uuid4()),
+        owner_scope=OwnerScope(kind="user", id=TEST_USER_ID),
     )
     runtime.start_run(run.run_id)
     # Find the node run created for n1
@@ -133,7 +140,7 @@ class TestHumanGatePersistence:
     def test_compiled_workflow_materializes_fixed_revision_gate(self, runtime, factory):
         workflow_id, revision_id = uuid.uuid4(), uuid.uuid4()
         with factory.begin() as session:
-            session.add(WorkflowModel(workflow_id=workflow_id, owner_scope="user:test"))
+            session.add(WorkflowModel(workflow_id=workflow_id, owner_scope=f"user:{TEST_USER_ID}"))
             session.add(WorkflowRevisionModel(
                 revision_id=revision_id, workflow_id=workflow_id, revision_number=1,
                 graph_hash="gate-g", execution_hash="gate-e", registry_snapshot_id=uuid.uuid4(),
@@ -147,7 +154,7 @@ class TestHumanGatePersistence:
             resolved_graph={"nodes": [{"id": "approval", "type": "human_gate"}], "edges": []},
             plan_hash="compiled-gate",
         )
-        run = runtime.create_run(compiled_plan=plan, owner_scope=OwnerScope(kind="user", id=uuid.uuid4()))
+        run = runtime.create_run(compiled_plan=plan, owner_scope=OwnerScope(kind="user", id=TEST_USER_ID))
         runtime.start_run(run.run_id)
         with factory() as session:
             task = session.scalar(select(HumanTaskModel).where(HumanTaskModel.run_id == run.run_id))
@@ -419,7 +426,7 @@ class TestHumanGatePersistence:
 
     def test_authenticated_decision_is_idempotent_and_recovers_fixed_attempt(self, runtime, plan, factory):
         """A repeated client token produces one durable audit decision only."""
-        owner_id = uuid.uuid4()
+        owner_id = TEST_USER_ID
         run = runtime.create_run(
             compiled_plan=plan, owner_scope=OwnerScope(kind="user", id=owner_id),
         )
@@ -458,7 +465,7 @@ class TestHumanGatePersistence:
             assert persisted_attempt.fixed_input["human_gate_decision"]["payload"] == {"choice": "approve"}
 
     def test_cross_owner_actor_cannot_consume_gate_or_write_decision(self, runtime, plan, factory):
-        owner_id = uuid.uuid4()
+        owner_id = TEST_USER_ID
         run = runtime.create_run(
             compiled_plan=plan, owner_scope=OwnerScope(kind="user", id=owner_id),
         )
@@ -482,7 +489,7 @@ class TestHumanGatePersistence:
             )) is None
 
     def test_default_timeout_uses_declared_payload_on_original_attempt(self, runtime, plan, factory):
-        owner_id = uuid.uuid4()
+        owner_id = TEST_USER_ID
         run = runtime.create_run(compiled_plan=plan, owner_scope=OwnerScope(kind="user", id=owner_id))
         runtime.start_run(run.run_id)
         with factory() as session:
@@ -523,8 +530,12 @@ class TestHumanGatePersistence:
         )
         snapshot, _ = SqlRegistryService(factory).create_snapshot()
         from src.domain.workflow.compiler import WorkflowCompiler
+        # Re-read the draft so we use the post-save full_draft_hash;
+        # the activation contract is mandatory in TF-WF-004 P0.
+        confirmed = workflow_service.get_draft(workflow.workflow_id)
         revision, _ = workflow_service.publish_compiled_revision(
             workflow.workflow_id, snapshot, WorkflowCompiler(),
+            expected_draft_hash=confirmed.full_draft_hash,
         )
 
         async def request(token_value: str) -> httpx.Response:
@@ -589,11 +600,11 @@ def test_deadline_scanner_survives_restart_and_public_timeout_is_rejected(factor
     revision_id = uuid.uuid4()
     with factory.begin() as session:
         workflow_id = uuid.uuid4()
-        session.add(WorkflowModel(workflow_id=workflow_id, owner_scope="user:test"))
+        session.add(WorkflowModel(workflow_id=workflow_id, owner_scope=f"user:{TEST_USER_ID}"))
         session.add(WorkflowRevisionModel(revision_id=revision_id, workflow_id=workflow_id, revision_number=1,
             graph_hash="timeout", execution_hash="timeout", registry_snapshot_id=uuid.uuid4(), revision_status=RevisionStatus.ACTIVE))
     run = runtime.create_run(compiled_plan=CompiledExecutionPlan(plan_id=uuid.uuid4(), workflow_revision_id=revision_id,
-        registry_snapshot=RegistrySnapshot(snapshot_id=uuid.uuid4()), resolved_graph={"nodes": [{"id": "n", "type": "provider"}], "edges": []}, plan_hash="timeout"), owner_scope=OwnerScope(kind="user", id=uuid.uuid4()))
+        registry_snapshot=RegistrySnapshot(snapshot_id=uuid.uuid4()), resolved_graph={"nodes": [{"id": "n", "type": "provider"}], "edges": []}, plan_hash="timeout"), owner_scope=OwnerScope(kind="user", id=TEST_USER_ID))
     with factory() as session:
         node = session.scalar(select(NodeRunModel).where(NodeRunModel.run_id == run.run_id))
         assert node is not None

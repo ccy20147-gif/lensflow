@@ -15,7 +15,7 @@ from typing import Any
 from sqlalchemy import func, select
 
 from src.core.exceptions import ConflictError, ForbiddenError, NotFoundError, PolicyBlockedError, ValidationError_
-from src.schemas.enums import AttemptStatus, HumanTaskStatus, NodeRunStatus, RunStatus
+from src.schemas.enums import AttemptStatus, HumanTaskStatus, NodeRunStatus, RevisionStatus, RunStatus
 from src.schemas.models import (
     CompiledExecutionPlan,
     HumanTaskRecord,
@@ -574,6 +574,7 @@ class RuntimeService:
                 **({"dispatch": dispatch_payload} if dispatch_payload else {}),
             },
             purpose="provider_dispatch",
+            dedupe_key=str(provider_attempt.provider_attempt_id),
             created_at=datetime.now(timezone.utc),
         )
         self._outbox.append(outbox)
@@ -653,6 +654,7 @@ class RuntimeService:
                 "cost": actual_cost,
             },
             purpose="result_publish",
+            dedupe_key=str(provider_attempt_id),
             created_at=datetime.now(timezone.utc),
         )
         self._outbox.append(outbox)
@@ -1184,9 +1186,144 @@ class RuntimeService:
         ))
         node.status = NodeRunStatus.WAITING_USER
 
+    def _sql_reject_cross_owner_artifact_refs(
+        self, session: Any, request_owner: str, refs: Any,
+    ) -> None:
+        """Reject bare cross-owner ArtifactRef even if the compile gate missed it.
+
+        The compile gate (TF-WF-003) already authorises ArtifactRef vs the
+        canonical database row, but the runtime is the durable boundary that
+        runs scheduled DAGs.  This check uses the same rule: every declared
+        ArtifactRef whose canonical ``owner_scope`` differs from the run
+        caller is rejected, regardless of any inline ``owner_scope`` field
+        the caller put on the Pydantic shape.
+
+        ``refs`` may be either a Pydantic ``CompiledExecutionPlan`` (legacy
+        callers) or a raw ``list`` of ``ArtifactRef`` dicts sourced from the
+        persisted ``plan_row.plan_json``.  In Foundation scope we only feed
+        the persisted list so a caller-supplied Pydantic shape can never
+        widen what the durable plan authorised.
+        """
+        if isinstance(refs, list):
+            raw_refs = refs
+        elif hasattr(refs, "resolved_input_refs"):
+            raw_refs = list(getattr(refs, "resolved_input_refs") or [])
+        else:
+            raw_refs = []
+        for ref in raw_refs:
+            artifact_version_id = getattr(ref, "artifact_version_id", None) or (
+                ref.get("artifact_version_id") if isinstance(ref, dict) else None
+            )
+            if not artifact_version_id:
+                continue
+            try:
+                av_id = uuid.UUID(str(artifact_version_id))
+            except (TypeError, ValueError) as exc:
+                raise ConflictError("ArtifactRef 缺少有效的 artifact_version_id") from exc
+            artifact = session.get(ArtifactVersionModel, av_id)
+            if artifact is None:
+                raise ConflictError("ArtifactRef 指向不存在的 ArtifactVersion")
+            if artifact.owner_scope != request_owner:
+                raise ForbiddenError("跨 owner 裸 ArtifactRef 必须先提升为 ResourceRevision")
+
     def _sql_create_run(self, plan: CompiledExecutionPlan, owner: OwnerScope, inputs: dict[str, Any]) -> WorkflowRun:
+        """Foundation run creation gate.
+
+        TF-WF-006 FR-10 / TF-OPS-001 FR-1 / TF-WF-005 FR-5 demand that every
+        run consume only a successful immutable plan and never a mutable
+        draft.  This entry point re-validates three things in PostgreSQL,
+        independent of any caller-supplied metadata on the plan Pydantic
+        shape:
+
+          1. A successful ``compiled_execution_plans`` row exists for this
+             ``plan_id`` and its ``workflow_revision_id`` and ``plan_hash``
+             match the immutable plan.
+          2. The referenced WorkflowRevision is ACTIVE and its parent
+             Workflow has the same ``owner_scope`` as the caller.
+          3. Every cross-owner bare ``ArtifactRef`` declared in the plan
+             ``resolved_input_refs`` is rejected even if a client tried to
+             sneak one past the compile gate.  The runtime is the durable
+             enforcement boundary for runtime gating.
+
+        When the plan row is persisted, the *durable* ``plan_row.plan_json``
+        is the authoritative source for the resolved graph and the
+        resolved input refs.  Any divergence between the caller's
+        ``plan.resolved_graph`` and ``plan_row.plan_json`` is treated as a
+        fail-closed contract violation: a caller-supplied Pydantic shape
+        can never widen or alter the durable execution contract.
+        In-memory test paths (``plan_row is None``) are allowed to keep
+        their caller-supplied graph because the public
+        ``/api/v1/runtime/start`` endpoint always persists the plan before
+        reaching this method.
+
+        The check runs inside the same transaction that persists the new
+        ``workflow_runs`` row, so a failure rolls everything back without
+        leaving a half-created run.
+        """
         assert self._session_factory is not None
         with self._session_factory.begin() as session:
+            plan_row = session.get(CompiledExecutionPlanModel, plan.plan_id)
+            if plan_row is not None:
+                if plan_row.status != "succeeded":
+                    raise ConflictError("WorkflowRun 只能消费成功的 CompiledExecutionPlan")
+                if (
+                    plan_row.workflow_revision_id != plan.workflow_revision_id
+                    or plan_row.plan_hash != plan.plan_hash
+                ):
+                    raise ConflictError("CompiledExecutionPlan 与固定 Revision 不一致")
+                revision_id = plan_row.workflow_revision_id
+            else:
+                revision_id = plan.workflow_revision_id
+            revision_row = session.get(WorkflowRevisionModel, revision_id)
+            if revision_row is not None:
+                if revision_row.revision_status != RevisionStatus.ACTIVE:
+                    raise ConflictError("WorkflowRevision 不是 ACTIVE")
+                workflow_row = session.get(WorkflowModel, revision_row.workflow_id)
+                if workflow_row is None:
+                    raise NotFoundError("Workflow", str(revision_row.workflow_id))
+                if workflow_row.owner_scope != owner.scoped_id:
+                    raise ForbiddenError("非 Workflow owner 不能为此 Revision 创建运行")
+                # Build the durable execution contract from plan_row.plan_json.
+                # For partial-run slices we additionally accept a side-channel
+                # "partial_run" closure on input_snapshot; the rest of the
+                # graph still comes from the persisted plan.  The closure is
+                # validated below against the persisted slice graph.
+                if plan_row is not None:
+                    persisted_plan_json = dict(plan_row.plan_json or {})
+                    persisted_resolved_graph = dict(persisted_plan_json.get("resolved_graph") or {})
+                    persisted_input_refs = list(persisted_plan_json.get("resolved_input_refs") or [])
+                    self._sql_reject_cross_owner_artifact_refs(
+                        session, owner.scoped_id, persisted_input_refs,
+                    )
+                    # When the caller is a partial-run we still anchor
+                    # scheduling to the persisted plan_json but honour the
+                    # closure scope.
+                    if isinstance(inputs.get("partial_run"), dict):
+                        resolved_graph = self._resolve_partial_graph(
+                            persisted_resolved_graph, dict(inputs["partial_run"]),
+                        )
+                    else:
+                        resolved_graph = persisted_resolved_graph
+                else:
+                    # Revision is persisted but no CompiledExecutionPlan row.
+                    # Legacy in-memory tests still need a node-less Run shape
+                    # so we keep their caller-supplied graph and skip the
+                    # cross-owner gate (the compile gate ran in-process).
+                    resolved_graph = (
+                        dict(plan.resolved_graph) if isinstance(plan.resolved_graph, dict) else {}
+                    )
+            elif plan_row is not None or revision_row is None:
+                # Either a persisted plan points at a missing revision,
+                # or the caller never persisted the plan/revision at all.
+                # Both are fail-closed: the runtime must consume a
+                # successful CompiledExecutionPlan that was already
+                # durable on disk.
+                raise NotFoundError("WorkflowRevision", str(revision_id))
+            else:
+                # Legacy in-memory test paths: defer to the caller.
+                resolved_graph = (
+                    dict(plan.resolved_graph) if isinstance(plan.resolved_graph, dict) else {}
+                )
             row = WorkflowRunModel(
                 run_id=uuid.uuid4(), workflow_revision_id=plan.workflow_revision_id,
                 compiled_plan_id=plan.plan_id, owner_scope=owner.scoped_id,
@@ -1197,8 +1334,8 @@ class RuntimeService:
             # Models deliberately avoid ORM relationships; flush the parent before
             # inserting child runs so PostgreSQL sees the FK target.
             session.flush()
-            nodes = [node for node in plan.resolved_graph.get("nodes", []) if isinstance(node, dict)]
-            edges = [edge for edge in plan.resolved_graph.get("edges", []) if isinstance(edge, dict)]
+            nodes = [node for node in resolved_graph.get("nodes", []) if isinstance(node, dict)]
+            edges = [edge for edge in resolved_graph.get("edges", []) if isinstance(edge, dict)]
             incoming = {str(edge.get("target", "")) for edge in edges}
             for node_data in nodes:
                 data = node_data if isinstance(node_data, dict) else {}
@@ -1213,6 +1350,33 @@ class RuntimeService:
             session.flush()
             self._sql_schedule_ready(session, row, graph={"nodes": nodes, "edges": edges})
             return self._run_schema(row)
+
+    def _resolve_partial_graph(
+        self, persisted_graph: dict[str, Any], closure: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Restrict the persisted graph to the partial-run slice contract.
+
+        The persisted ``resolved_graph`` is the authoritative DAG; the
+        closure only restricts scheduling to the listed ``execute`` and
+        ``reuse`` nodes.  This keeps the partial-run slice anchored to
+        the durable plan and prevents a caller from widening the executed
+        DAG beyond what the plan author approved.
+        """
+        execute = {str(value) for value in closure.get("execute", [])}
+        reuse = {str(value) for value in closure.get("reuse", [])}
+        if not execute or execute & reuse:
+            raise ValidationError_("Partial run closure is invalid")
+        persisted_nodes = [
+            node for node in persisted_graph.get("nodes", [])
+            if isinstance(node, dict) and str(node.get("id")) in execute
+        ]
+        persisted_edges = [
+            edge for edge in persisted_graph.get("edges", [])
+            if isinstance(edge, dict)
+            and str(edge.get("source")) in execute
+            and str(edge.get("target")) in execute
+        ]
+        return {"nodes": persisted_nodes, "edges": persisted_edges}
 
     def _sql_schedule_ready(self, session: Any, run: WorkflowRunModel, *, graph: dict[str, Any] | None = None) -> None:
         """Materialise ready attempts from the immutable graph, never latest Draft.
@@ -1678,7 +1842,9 @@ class RuntimeService:
                     # a crash before the provider outcome was known.
                     **({"dispatch": dispatch_payload} if dispatch_payload else {}),
                 },
-                purpose="provider_dispatch", created_at=datetime.now(timezone.utc),
+                purpose="provider_dispatch",
+                dedupe_key=str(provider.provider_attempt_id),
+                created_at=datetime.now(timezone.utc),
             )
             session.add_all([provider, event])
             attempt.status = AttemptStatus.WAITING_EXTERNAL
@@ -1722,13 +1888,22 @@ class RuntimeService:
             event = OutboxEventModel(
                 event_id=uuid.uuid4(), aggregate_type="provider_invocation", aggregate_id=provider_attempt_id,
                 event_type="provider.result", payload={"record_id": str(record.record_id), "status": "completed", "cost": actual_cost},
-                purpose="result_publish", created_at=now,
+                purpose="result_publish",
+                dedupe_key=str(provider_attempt_id),
+                created_at=now,
             )
             session.add_all([record, event])
             for index, artifact_id in enumerate(artifact_ids):
+                # Foundation scope: every OutputBinding must carry the
+                # producing Run's owner_scope so the bootstrap blocker in
+                # resource_repository can match it against the
+                # ArtifactVersion's owner and refuse same-owner bypass
+                # attempts.  Without this, runtime-produced bindings
+                # never enter the bootstrap-block path.
                 session.add(ProviderOutputBindingModel(
                     binding_id=uuid.uuid4(), record_id=record.record_id,
                     output_artifact_version_id=artifact_id, output_index=index,
+                    owner_scope=run.owner_scope,
                 ))
             provider.status = AttemptStatus.COMPLETED
             attempt.status, attempt.completed_at = AttemptStatus.COMPLETED, now
@@ -1788,10 +1963,20 @@ class RuntimeService:
                 idempotency_key=provider.idempotency_key, request_body_hash=provider.request_body_hash,
                 response_fingerprint=response_fingerprint, usage=usage, actual_cost=actual_cost, started_at=now, completed_at=now)
             event = OutboxEventModel(event_id=uuid.uuid4(), aggregate_type="provider_invocation", aggregate_id=provider_attempt_id,
-                event_type="provider.result", payload={"record_id": str(record.record_id), "status": "completed", "cost": actual_cost}, purpose="result_publish", created_at=now)
+                event_type="provider.result", payload={"record_id": str(record.record_id), "status": "completed", "cost": actual_cost}, purpose="result_publish",
+                dedupe_key=str(provider_attempt_id), created_at=now)
             session.add_all([record, event])
             for index, artifact_id in enumerate(artifact_ids):
-                session.add(ProviderOutputBindingModel(binding_id=uuid.uuid4(), record_id=record.record_id, output_artifact_version_id=artifact_id, output_index=index))
+                # Foundation scope: same owner_scope contract as the
+                # _sql_record_provider_result path above; both result
+                # publishers must leave behind a binding whose owner_scope
+                # matches the producer Run so bootstrap and promotion
+                # gates can verify same-owner provenance.
+                session.add(ProviderOutputBindingModel(
+                    binding_id=uuid.uuid4(), record_id=record.record_id,
+                    output_artifact_version_id=artifact_id, output_index=index,
+                    owner_scope=run.owner_scope,
+                ))
             provider.status = AttemptStatus.COMPLETED
             attempt.status, attempt.completed_at = AttemptStatus.COMPLETED, now
             node_run.status = NodeRunStatus.COMPLETED
@@ -1827,7 +2012,14 @@ class RuntimeService:
 
     @staticmethod
     def _outbox_schema(row: Any) -> OutboxEvent:
-        return OutboxEvent(event_id=row.event_id, aggregate_type=row.aggregate_type, aggregate_id=row.aggregate_id, event_type=row.event_type, payload=row.payload or {}, purpose=row.purpose, created_at=row.created_at, published_at=row.published_at, retry_count=row.retry_count)
+        return OutboxEvent(
+            event_id=row.event_id, aggregate_type=row.aggregate_type,
+            aggregate_id=row.aggregate_id, event_type=row.event_type,
+            payload=row.payload or {}, purpose=row.purpose,
+            dedupe_key=getattr(row, "dedupe_key", None),
+            created_at=row.created_at, published_at=row.published_at,
+            retry_count=row.retry_count,
+        )
 
     @staticmethod
     def _json_refs(refs: list[Any]) -> list[dict[str, Any]]:

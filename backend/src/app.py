@@ -22,12 +22,13 @@ import uuid
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from src.core.config import settings
-from src.core.exceptions import SafeError
+from src.core.exceptions import SafeError, ValidationError_
 from src.infra.db.session import get_session_factory
 
 @asynccontextmanager
@@ -128,6 +129,34 @@ async def safe_error_handler(request: Request, exc: SafeError):
         status_code=exc.status_code,
         content=exc.to_dict(),
     )
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(request: Request, exc: RequestValidationError):
+    """Convert Pydantic request validation failures into the standard
+    ``SafeError`` envelope.  The route still gets a 422, but the body
+    matches every other error response and clients can rely on
+    ``error.code / error.message / error.details`` instead of having
+    to special-case ``detail: [{type, loc, msg, ...}]``.
+    """
+    correlation_id = getattr(request.state, "correlation_id", None)
+    # Build a stable human message and a structured detail list so the
+    # canvas can still pinpoint the offending field.
+    errors = exc.errors()
+    if errors:
+        first = errors[0]
+        loc = ".".join(str(part) for part in first.get("loc", []) if part != "body")
+        message = first.get("msg", "校验失败")
+        if loc:
+            message = f"{message} (field: {loc})"
+    else:
+        message = "校验失败"
+    safe = ValidationError_(
+        message=message,
+        details={"errors": errors},
+        correlation_id=correlation_id,
+    )
+    return JSONResponse(status_code=safe.status_code, content=safe.to_dict())
 
 
 # --- Health Endpoints ---

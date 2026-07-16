@@ -122,4 +122,5 @@
 - 已决策：发布 CreativeWorkRevision，不等同公开源工作流或授予任何复用权。
 - 已决策：创作草稿、作品修订、listing 草稿、listing 修订、上架与审核使用独立状态族；审核只针对不可变 ListingRevision。
 - 已决策：V1 私有项目 owner-only；跨 owner 来源只接受带授权证据的固定 ResourceRef，平台审核员不是项目成员。
+- 已决策：Screenplay 不能包装为 CreativeWork 绕过 TF-PLT-003/TF-STY-006 的完全私有边界。
 - 开放问题：无阻塞 V1 Community 的开放问题。

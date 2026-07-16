@@ -4,6 +4,15 @@ Hash rules (Foundation contract):
   - graph_hash = sha256(nodes + edges + config) — semantic content only
   - layout_hash = sha256(positions + visual metadata) — visual-only
   - execution_hash = sha256(graph_hash + all pinned dependency revisions)
+  - full_draft_hash = sha256(graph_hash + layout_hash + execution_hash +
+    draft_version) — used for compare-and-swap on the *whole* draft so that a
+    pure layout change cannot silently overwrite a concurrent save that the
+    author never saw.
+
+The full draft hash is what activate/save must use to protect against
+layout-only races: with graph_hash alone, two tabs that both only move a
+node would see identical ``graph_hash`` and the second save would clobber
+the first.
 """
 from __future__ import annotations
 
@@ -157,6 +166,34 @@ def compute_draft_hashes(
     return graph_hash, layout_hash, execution_hash
 
 
+def compute_full_draft_hash(
+    graph_hash: str,
+    layout_hash: str,
+    execution_hash: str,
+    draft_version: int,
+) -> str:
+    """Hash of every persisted draft field plus the draft version.
+
+    This is the compare-and-swap token for the *whole* draft.  Two tabs that
+    only move a node produce identical ``graph_hash`` and ``execution_hash``
+    but different ``layout_hash``, and any save still bumps ``draft_version``
+    — so two writers can no longer both pass a CAS on graph_hash alone.
+    The contract is the union of every persisted fact; for callers that
+    already have a graph_hash-only token (older clients), see
+    ``graph_hash_matches_full``.
+    """
+    hasher = hashlib.sha256()
+    hasher.update(b"graph:")
+    hasher.update(graph_hash.encode())
+    hasher.update(b"|layout:")
+    hasher.update(layout_hash.encode())
+    hasher.update(b"|exec:")
+    hasher.update(execution_hash.encode())
+    hasher.update(b"|v:")
+    hasher.update(str(draft_version).encode())
+    return hasher.hexdigest()
+
+
 def create_draft(
     workflow_id: UUID,
     draft_version: int = 1,
@@ -174,6 +211,9 @@ def create_draft(
     graph_hash, layout_hash, execution_hash = compute_draft_hashes(
         graph, config, layout, pinned_dependency_revisions
     )
+    full_draft_hash = compute_full_draft_hash(
+        graph_hash, layout_hash, execution_hash, draft_version,
+    )
 
     return WorkflowDraft(
         workflow_id=workflow_id,
@@ -185,6 +225,7 @@ def create_draft(
         graph_hash=graph_hash,
         layout_hash=layout_hash,
         execution_hash=execution_hash,
+        full_draft_hash=full_draft_hash,
         updated_at=datetime.now(timezone.utc),
     )
 

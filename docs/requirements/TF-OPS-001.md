@@ -4,7 +4,7 @@
 
 - ID：TF-OPS-001
 - 标题：Provider、模型与密钥管理
-- 状态：defined
+- 状态：in_delivery
 - 目标版本：Foundation -> V1 Core
 - 优先级：P0
 - 全局位置：设置/平台内核
@@ -162,6 +162,7 @@ ProviderInvocationAttempt 不拥有独立状态机，复用关联 NodeRunAttempt
 - V1 Core 逐个 Provider 功能开关接入，先 shadow 健康与能力比较。
 - adapter 回退时固定旧能力 snapshot；不支持的新模型停止新运行。
 - 发布证据包括 secret 扫描、真实调用、fallback 和轮换演练。
+- 2026-07-16 Foundation 验收：批次 C 的持久 Provider 调用事实链已独立验证，包括提交 intent、stable idempotency key、unknown 对账、结果 fencing、单 record/多 output binding 与 dispatch/result outbox dedupe_key；`8c9d0e1f2a3b` 增加部分唯一 `(purpose, dedupe_key)` 约束。真实 Provider spike 未配置凭证，未作为通过证据；能力版本矩阵、健康、fallback、轮换与完整真实调用仍在交付中，状态为 `in_delivery`。
 
 ## 16. 已决策事项与开放问题
 
